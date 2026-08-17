@@ -3,6 +3,7 @@ import { createElement, type ComponentType } from "react";
 import { SvgXml } from "react-native-svg";
 import { ClaudeIcon } from "@/components/icons/claude-icon";
 import { CodexIcon } from "@/components/icons/codex-icon";
+import { CommandCodeIcon } from "@/components/icons/commandcode-icon";
 import { CopilotIcon } from "@/components/icons/copilot-icon";
 import { MiniMaxIcon } from "@/components/icons/minimax-icon";
 import { OpenCodeIcon } from "@/components/icons/opencode-icon";
@@ -21,6 +22,7 @@ export type ProviderIconComponent = ComponentType<ProviderIconProps>;
 const BUILTIN_PROVIDER_ICONS: Record<string, ProviderIconComponent> = {
   claude: ClaudeIcon as unknown as ProviderIconComponent,
   codex: CodexIcon as unknown as ProviderIconComponent,
+  commandcode: CommandCodeIcon as unknown as ProviderIconComponent,
   copilot: CopilotIcon as unknown as ProviderIconComponent,
   kiro: PackagePlus,
   minimax: MiniMaxIcon as unknown as ProviderIconComponent,

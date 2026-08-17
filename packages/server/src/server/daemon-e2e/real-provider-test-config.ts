@@ -8,12 +8,13 @@ import type { AgentClient, AgentProvider, AgentSessionConfig } from "../agent/ag
 import type { ProviderRuntimeSettings } from "../agent/provider-launch-config.js";
 import { ClaudeAgentClient } from "../agent/providers/claude/agent.js";
 import { CodexAppServerAgentClient } from "../agent/providers/codex-app-server-agent.js";
+import { CommandCodeAgentClient } from "../agent/providers/commandcode/agent.js";
 import { OpenCodeAgentClient } from "../agent/providers/opencode-agent.js";
 import { OmpAgentClient } from "../agent/providers/omp/agent.js";
 import { PiRpcAgentClient } from "../agent/providers/pi/agent.js";
 import { isCommandAvailable } from "../../executable-resolution/executable-resolution.js";
 
-export const realProviders = ["claude", "codex", "opencode", "pi", "omp"] as const;
+export const realProviders = ["claude", "codex", "opencode", "pi", "omp", "commandcode"] as const;
 export type RealProvider = (typeof realProviders)[number];
 export type RealProviderConfig = Pick<
   AgentSessionConfig,
@@ -67,6 +68,12 @@ export function getRealProviderConfig(provider: RealProvider): RealProviderConfi
         model: getOmpRealTestModel(),
         thinkingOptionId: "medium",
         modeId: "full",
+      };
+    case "commandcode":
+      return {
+        provider,
+        model: "claude-sonnet-4-6",
+        modeId: "yolo",
       };
   }
 }
@@ -129,6 +136,9 @@ export function getRealProviderRuntimeSettings(provider: RealProvider): Provider
     }
     case "pi":
       return {};
+    case "commandcode":
+      // Command Code manages its own auth (like Copilot); no env needed.
+      return {};
   }
 }
 
@@ -151,6 +161,8 @@ export function createRealProviderClient(provider: RealProvider, logger: Logger)
       return new PiRpcAgentClient({ logger, runtimeSettings });
     case "omp":
       return new OmpAgentClient({ logger, runtimeSettings });
+    case "commandcode":
+      return new CommandCodeAgentClient({ logger, runtimeSettings });
   }
 }
 
@@ -170,7 +182,12 @@ export function canRunRealProvider(provider: RealProvider): Promise<boolean> {
   }
 
   const availability = (async () => {
-    if (provider !== "omp" && provider !== "pi" && !getOpenRouterApiKeyOrNull()) {
+    if (
+      provider !== "omp" &&
+      provider !== "pi" &&
+      provider !== "commandcode" &&
+      !getOpenRouterApiKeyOrNull()
+    ) {
       return false;
     }
     return await isCommandAvailable(getProviderBinary(provider));
@@ -251,6 +268,9 @@ function getProviderBinary(provider: RealProvider): string {
   }
   if (provider === "omp") {
     return process.env.OMP_COMMAND ?? "omp";
+  }
+  if (provider === "commandcode") {
+    return process.env.COMMANDCODE_COMMAND ?? "cmd";
   }
   return provider;
 }

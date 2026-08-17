@@ -66,6 +66,14 @@ export const agentConfigs = {
       ask: "ask", // launches omp with always-ask approval mode
     },
   },
+  commandcode: {
+    provider: "commandcode",
+    model: "claude-sonnet-4-6",
+    modes: {
+      full: "yolo",
+      ask: "default",
+    },
+  },
 } as const satisfies Record<string, AgentTestConfig>;
 
 export type AgentProvider = keyof typeof agentConfigs;
@@ -101,4 +109,11 @@ export function getAskModeConfig(provider: AgentProvider) {
 /**
  * Helper to run a test for each provider.
  */
-export const allProviders: AgentProvider[] = ["claude", "codex", "opencode", "pi", "omp"];
+export const allProviders: AgentProvider[] = [
+  "claude",
+  "codex",
+  "opencode",
+  "pi",
+  "omp",
+  "commandcode",
+];

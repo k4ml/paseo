@@ -2,6 +2,7 @@ export const BUILTIN_PROVIDER_ICON_NAMES = [
   "claude",
   "codex",
   "copilot",
+  "commandcode",
   "kiro",
   "minimax",
   "omp",

@@ -167,6 +167,38 @@ export const OMP_MODES: AgentProviderModeDefinition[] = [
   },
 ];
 
+const COMMANDCODE_MODES: AgentProviderModeDefinition[] = [
+  {
+    id: "default",
+    label: "Default",
+    description: "Prompts for permission before edits and commands",
+    icon: "Shield",
+    colorTier: "safe",
+  },
+  {
+    id: "auto-accept",
+    label: "Auto Accept",
+    description: "Accepts file edits automatically",
+    icon: "ShieldPlus",
+    colorTier: "moderate",
+  },
+  {
+    id: "plan",
+    label: "Plan",
+    description: "Read-only planning mode that avoids file edits",
+    icon: "ShieldEllipsis",
+    colorTier: "planning",
+  },
+  {
+    id: "yolo",
+    label: "Yolo",
+    description: "Bypasses all permission prompts",
+    icon: "ShieldOff",
+    colorTier: "dangerous",
+    isUnattended: true,
+  },
+];
+
 const MOCK_LOAD_TEST_MODES: AgentProviderModeDefinition[] = [
   {
     id: "load-test",
@@ -254,6 +286,14 @@ export const AGENT_PROVIDER_DEFINITIONS: AgentProviderDefinition[] = [
     enabledByDefault: false,
     defaultModeId: "full",
     modes: OMP_MODES,
+  },
+  {
+    id: "commandcode",
+    label: "Command Code",
+    description:
+      "Command Code — coding agent that learns your coding taste, with multi-provider model support",
+    defaultModeId: "default",
+    modes: COMMANDCODE_MODES,
   },
 ];
 
