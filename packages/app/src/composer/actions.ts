@@ -1,3 +1,5 @@
+import type { SelectedFile } from "@/attachments/selected-file";
+import { FILE_UPLOAD_MAX_BYTES } from "@/attachments/upload-limit";
 import type { ForgeSearchItem } from "@getpaseo/protocol/messages";
 import type { ActiveTurnBehavior } from "@getpaseo/protocol/messages";
 import type {
@@ -53,7 +55,7 @@ export interface ComposerSendClient {
       images: Array<{ data: string; mimeType: string }>;
       attachments: ReturnType<typeof splitComposerAttachmentsForSubmit>["attachments"];
     },
-  ) => Promise<void>;
+  ) => Promise<unknown>;
   uploadFile: (input: { fileName: string; mimeType: string; bytes: Uint8Array }) => Promise<{
     requestId: string;
     file: {
@@ -123,11 +125,26 @@ export async function pickAndPersistImages(input: {
 
 export async function uploadFileAttachments(input: {
   client: ComposerSendClient;
-  files: Array<{ fileName: string; mimeType: string; bytes: Uint8Array }>;
+  files: SelectedFile[];
 }): Promise<Extract<ComposerAttachment, { kind: "file" }>[]> {
   const result: Extract<ComposerAttachment, { kind: "file" }>[] = [];
+  const prepared: Array<{ fileName: string; mimeType: string; bytes: Uint8Array }> = [];
 
   for (const file of input.files) {
+    const bytes = await file.readBytes();
+    if (bytes.byteLength > FILE_UPLOAD_MAX_BYTES) {
+      throw new Error(
+        i18n.t("composer.errors.fileTooLarge", { size: "50MB", fileName: file.fileName }),
+      );
+    }
+    prepared.push({
+      fileName: file.fileName,
+      mimeType: file.mimeType,
+      bytes,
+    });
+  }
+
+  for (const file of prepared) {
     const response = await input.client.uploadFile(file);
     if (response.error || !response.file) {
       throw new Error(response.error ?? "Upload failed.");
@@ -356,7 +373,9 @@ function isForgeAttachment(
   return (
     attachment.kind === "forge_issue" ||
     attachment.kind === "forge_change_request" ||
-    // COMPAT(githubAttachmentKinds): added in v0.1.106, remove after 2026-12-28 once daemon floor >= v0.1.106
+    // COMPAT(githubAttachmentKinds): accept legacy persisted attachment kinds
+    // until 2027-01-17, when supported floors are >= v0.2.0 and old drafts no
+    // longer require them.
     attachment.kind === "github_issue" ||
     attachment.kind === "github_pr"
   );
@@ -376,17 +395,17 @@ export function toggleForgeAttachment(
   return [...current, buildForgeAttachment(item)];
 }
 
-interface ToggleGithubAttachmentFromPickerInput {
+interface ToggleForgeAttachmentFromPickerInput {
   current: UserComposerAttachment[];
   item: ForgeSearchItem;
-  markGithubAttachmentRemoved: (attachment: UserComposerAttachment) => void;
+  markForgeAttachmentRemoved: (attachment: UserComposerAttachment) => void;
 }
 
-export function toggleGithubAttachmentFromPicker({
+export function toggleForgeAttachmentFromPicker({
   current,
   item,
-  markGithubAttachmentRemoved,
-}: ToggleGithubAttachmentFromPickerInput): UserComposerAttachment[] {
+  markForgeAttachmentRemoved,
+}: ToggleForgeAttachmentFromPickerInput): UserComposerAttachment[] {
   const existingAttachment = current.find(
     (attachment) =>
       isForgeAttachment(attachment) &&
@@ -394,19 +413,19 @@ export function toggleGithubAttachmentFromPicker({
       attachment.item.number === item.number,
   );
   if (existingAttachment) {
-    markGithubAttachmentRemoved(existingAttachment);
+    markForgeAttachmentRemoved(existingAttachment);
   }
   return toggleForgeAttachment(current, item);
 }
 
-export function findGithubItemByOption(
+export function findForgeItemByOption(
   items: readonly ForgeSearchItem[],
   optionId: string,
 ): ForgeSearchItem | undefined {
   return items.find((candidate) => `${candidate.kind}:${candidate.number}` === optionId);
 }
 
-export function isAttachmentSelectedForGithubItem(
+export function isAttachmentSelectedForForgeItem(
   current: readonly ComposerAttachment[],
   item: ForgeSearchItem,
 ): boolean {
@@ -417,5 +436,3 @@ export function isAttachmentSelectedForGithubItem(
       attachment.item.number === item.number,
   );
 }
-
-export const toggleGithubAttachment = toggleForgeAttachment;

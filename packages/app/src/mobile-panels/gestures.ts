@@ -1,5 +1,5 @@
-import { useCallback, useMemo } from "react";
-import { Gesture } from "react-native-gesture-handler";
+import { createContext, useContext, useRef, type RefObject, useCallback, useMemo } from "react";
+import { Gesture, type GestureType } from "react-native-gesture-handler";
 import { useSharedValue } from "react-native-reanimated";
 import { scheduleOnRN } from "react-native-worklets";
 import { isWeb } from "@/constants/platform";
@@ -95,7 +95,7 @@ export function useOpenAgentListGesture(enabled: boolean) {
           }
         })
         .onStart(() => {
-          startedRevision.value = beginGesture({ origin: "agent", preview: "agent-list" });
+          startedRevision.value = beginGesture({ origin: "agent" });
         })
         .onUpdate((event) => {
           updateGesture(startedRevision.value, -event.translationX / windowWidth);
@@ -188,7 +188,6 @@ export function useCloseAgentListGesture() {
         .onStart(() => {
           startedRevision.value = beginGesture({
             origin: "agent-list",
-            preview: "agent-list",
           });
         })
         .onUpdate((event) => {
@@ -290,7 +289,6 @@ export function useOpenFileExplorerGesture({ enabled, onOpen }: OpenFileExplorer
         .onStart(() => {
           startedRevision.value = beginGesture({
             origin: "agent",
-            preview: "file-explorer",
           });
         })
         .onUpdate((event) => {
@@ -326,17 +324,16 @@ export function useOpenFileExplorerGesture({ enabled, onOpen }: OpenFileExplorer
   );
 }
 
-export function useCloseFileExplorerGesture() {
-  const {
-    beginGesture,
-    finishGesture,
-    motionState,
-    position,
-    rightCloseGestureRef,
-    updateGesture,
-    windowWidth,
-  } = useMobilePanelsRuntime();
+export const FileExplorerCloseGestureContext = createContext<RefObject<
+  GestureType | undefined
+> | null>(null);
+
+export function useCloseFileExplorerGesture(enabled = true) {
+  const rightCloseGestureRef = useRef<GestureType | undefined>(undefined);
+  const { beginGesture, finishGesture, motionState, position, updateGesture, windowWidth } =
+    useMobilePanelsRuntime();
   const { startedRevision, touchStartX, touchStartY } = useGestureState();
+  const horizontalScroll = useHorizontalScrollOptional();
   const showMobileAgent = usePanelStore((state) => state.showMobileAgent);
   const commit = useRevisionCommit(showMobileAgent);
 
@@ -344,6 +341,7 @@ export function useCloseFileExplorerGesture() {
     () =>
       Gesture.Pan()
         .withRef(rightCloseGestureRef)
+        .enabled(enabled)
         .manualActivation(true)
         .onTouchesDown((event) => {
           const touch = event.changedTouches[0];
@@ -372,6 +370,7 @@ export function useCloseFileExplorerGesture() {
           });
           if (
             !canBeginMobilePanelGesture(motionState.value, "file-explorer", position.value) ||
+            horizontalScroll?.activeGestureStartedScrolled.value ||
             panIntent === "fail"
           ) {
             stateManager.fail();
@@ -384,7 +383,6 @@ export function useCloseFileExplorerGesture() {
         .onStart(() => {
           startedRevision.value = beginGesture({
             origin: "file-explorer",
-            preview: "file-explorer",
           });
         })
         .onUpdate((event) => {
@@ -402,9 +400,11 @@ export function useCloseFileExplorerGesture() {
           }
         }),
     [
+      enabled,
       beginGesture,
       commit,
       finishGesture,
+      horizontalScroll?.activeGestureStartedScrolled,
       motionState,
       position,
       rightCloseGestureRef,
@@ -420,5 +420,5 @@ export function useCloseFileExplorerGesture() {
 }
 
 export function useFileExplorerCloseGestureRef() {
-  return useMobilePanelsRuntime().rightCloseGestureRef;
+  return useContext(FileExplorerCloseGestureContext);
 }

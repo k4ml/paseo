@@ -1,19 +1,32 @@
-import { useSyncExternalStore } from "react";
+import { PluginTranslationRuntime } from "@getpaseo/plugin/client/host";
+import { i18n } from "@/i18n/i18next";
+import type { AudioEngine } from "@/audio";
+import { useMemo, useSyncExternalStore } from "react";
 import { QueryClient } from "@tanstack/react-query";
-import { evaluatePluginClientBundle } from "./evaluate";
+import { createPaseoApi } from "@getpaseo/client";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { assertPluginCompatibility } from "@getpaseo/protocol/plugin-requirements";
+import { resolveAppVersion } from "@/utils/app-version";
+import { createPluginClientRuntime } from "./client-runtime";
+import { runPluginClientBundle } from "./evaluate";
 import type { InstalledPlugin } from "./types";
 
-interface CatalogPlugin {
-  id: string;
-  clientBundle: string;
-}
+type CatalogPlugin = Awaited<ReturnType<DaemonClient["getPluginCatalog"]>>[number];
 
-class PluginRegistry {
+export class PluginRegistry {
   private readonly byHost = new Map<string, InstalledPlugin[]>();
   private readonly listeners = new Set<() => void>();
   private snapshot: InstalledPlugin[] = [];
   private readonly disposed = new WeakSet<InstalledPlugin>();
   private readonly evaluationErrors = new Map<string, string>();
+
+  constructor(
+    private readonly dependencies: {
+      localeSource: import("@getpaseo/plugin/client/host").PluginLocaleSource;
+      version: string | null;
+      createRuntime: typeof createPluginClientRuntime;
+    },
+  ) {}
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -29,15 +42,23 @@ class PluginRegistry {
   installCatalog(
     serverId: string,
     catalog: CatalogPlugin[],
-    options: { replacePluginId?: string } = {},
-  ): void {
+    options: {
+      replacePluginId?: string;
+      client: DaemonClient;
+      audio: Pick<AudioEngine, "play">;
+    },
+  ): boolean {
     const previous = this.byHost.get(serverId) ?? [];
+    const previousTimelineBundles = previous
+      .filter((plugin) => plugin.timelineTransformers.length > 0)
+      .map((plugin) => `${plugin.id}\0${plugin.clientBundle}`);
     const preserved = catalog.flatMap((entry) => {
       const existing = previous.find(
         (plugin) =>
           plugin.id !== options.replacePluginId &&
           plugin.id === entry.id &&
-          plugin.clientBundle === entry.clientBundle,
+          plugin.clientBundle === entry.clientBundle &&
+          plugin.requirements?.paseo === entry.requirements?.paseo,
       );
       return existing ? [existing] : [];
     });
@@ -49,7 +70,10 @@ class PluginRegistry {
     }
     const installed = catalog.flatMap((entry) => {
       const key = `${serverId}/${entry.id}`;
+      let installation: InstalledPlugin | undefined;
       try {
+        if (!entry.clientBundle) return [];
+        assertPluginCompatibility({ ...entry, version: this.dependencies.version, runtime: "app" });
         const existing = preserved.find(
           (plugin) => plugin.id === entry.id && plugin.clientBundle === entry.clientBundle,
         );
@@ -57,18 +81,59 @@ class PluginRegistry {
           this.evaluationErrors.delete(key);
           return [existing];
         }
-        const queryClient = new QueryClient();
-        const evaluated = [
-          {
-            ...evaluatePluginClientBundle(entry.id, entry.clientBundle),
-            serverId,
-            clientBundle: entry.clientBundle,
-            queryClient,
-          },
-        ];
+        const client = options.client;
+        installation = {
+          lifetime: new AbortController(),
+          locale: this.dependencies.localeSource.getLocale(),
+          i18n: new PluginTranslationRuntime(this.dependencies.localeSource),
+          paseo: createPaseoApi(client),
+          invoke: (method, input) => client.invokePluginRpc(entry.id, method, input),
+          id: entry.id,
+          serverId,
+          clientBundle: entry.clientBundle,
+          requirements: entry.requirements,
+          queryClient: new QueryClient(),
+          cleanup: () => undefined,
+          surfaces: [],
+          settingsScreens: [],
+          sidebarItems: { header: [], footer: [] },
+          legacySidebarItems: [],
+          filePanels: [],
+          workspacePanels: [],
+          commandCenterItems: [],
+          clientSlashCommands: [],
+          attachmentSources: [],
+          themes: [],
+          timelineTransformers: [],
+          timelineRenderers: [],
+        };
+        const unsubscribeTranslations = installation.i18n.subscribe(() => this.publish());
+        installation.lifetime.signal.addEventListener("abort", unsubscribeTranslations, {
+          once: true,
+        });
+        const runtime = this.dependencies.createRuntime(installation, options.audio);
+        const evaluated = runPluginClientBundle(entry.id, entry.clientBundle, runtime, () =>
+          this.publish(),
+        );
+        Object.assign(installation, evaluated);
+        const paseo = installation.paseo;
+        installation.cleanup = async () => {
+          const results = await Promise.allSettled([paseo.dispose(), evaluated.cleanup()]);
+          const failures = results.filter((result) => result.status === "rejected");
+          if (failures.length)
+            throw new AggregateError(
+              failures.map((result) => result.reason),
+              "Plugin cleanup failed",
+            );
+        };
         this.evaluationErrors.delete(key);
-        return evaluated;
+        return [installation];
       } catch (error) {
+        installation?.lifetime.abort();
+        installation?.i18n.dispose();
+        void installation?.paseo
+          .dispose()
+          .catch((failure) => console.warn(`[Plugins] API cleanup failed for ${key}`, failure));
         this.evaluationErrors.set(key, error instanceof Error ? error.message : String(error));
         console.warn(`[Plugins] Failed to evaluate ${serverId}/${entry.id}`, error);
         return [];
@@ -81,7 +146,20 @@ class PluginRegistry {
       }
     }
     this.byHost.set(serverId, installed);
-    this.publish();
+    if (
+      installed.length !== catalog.length ||
+      installed.length !== previous.length ||
+      installed.some((plugin, index) => plugin !== previous[index])
+    ) {
+      this.publish();
+    }
+    const installedTimelineBundles = installed
+      .filter((plugin) => plugin.timelineTransformers.length > 0)
+      .map((plugin) => `${plugin.id}\0${plugin.clientBundle}`);
+    return (
+      previousTimelineBundles.length !== installedTimelineBundles.length ||
+      previousTimelineBundles.some((bundle, index) => bundle !== installedTimelineBundles[index])
+    );
   }
 
   removeHost(serverId: string): void {
@@ -98,6 +176,8 @@ class PluginRegistry {
   private dispose(plugin: InstalledPlugin): void {
     if (this.disposed.has(plugin)) return;
     this.disposed.add(plugin);
+    plugin.lifetime.abort();
+    plugin.i18n.dispose();
     plugin.queryClient.clear();
     try {
       void Promise.resolve(plugin.cleanup()).catch((error) => {
@@ -111,6 +191,9 @@ class PluginRegistry {
   private publish(): void {
     this.snapshot = [...this.byHost.values()]
       .flat()
+      // A new presentation snapshot invalidates label selectors without replacing the installation lifetime.
+      // eslint-disable-next-line no-map-spread
+      .map((plugin) => ({ ...plugin, locale: plugin.i18n.locale }))
       .sort((left, right) =>
         `${left.serverId}/${left.id}`.localeCompare(`${right.serverId}/${right.id}`),
       );
@@ -118,7 +201,19 @@ class PluginRegistry {
   }
 }
 
-export const pluginRegistry = new PluginRegistry();
+export const pluginRegistry = new PluginRegistry({
+  localeSource: {
+    getLocale: () => i18n.resolvedLanguage ?? i18n.language,
+    subscribe: (listener) => {
+      i18n.on("languageChanged", listener);
+      return () => {
+        i18n.off("languageChanged", listener);
+      };
+    },
+  },
+  version: resolveAppVersion(),
+  createRuntime: createPluginClientRuntime,
+});
 
 export function useInstalledPlugins(): InstalledPlugin[] {
   return useSyncExternalStore(
@@ -137,5 +232,6 @@ export function useInstalledPlugin(serverId: string, pluginId: string): Installe
 }
 
 export function usePluginInstallations(pluginId: string): InstalledPlugin[] {
-  return useInstalledPlugins().filter((plugin) => plugin.id === pluginId);
+  const installed = useInstalledPlugins();
+  return useMemo(() => installed.filter((plugin) => plugin.id === pluginId), [installed, pluginId]);
 }

@@ -105,6 +105,31 @@ const child = await workspace.agents.create({
 
 `parent` establishes parentage. Archiving a parent cascade-archives its children. Call `detach()` first when a child should continue independently.
 
+## Run work in a background workspace
+
+Create a background workspace and its first agent in one call. Put `background` on the
+workspace options and the agent's configuration under `agent`:
+
+```ts
+const cwd = "/Users/me/dev/storefront";
+const workspace = await client.workspaces.create({
+  source: { kind: "directory", path: cwd },
+  background: true,
+  agent: {
+    cwd,
+    config: { provider: "codex/gpt-5.5" },
+    prompt: "Review the checkout flow.",
+  },
+});
+```
+
+The call returns a workspace handle and starts its first agent with the supplied prompt.
+
+Background agents keep their history and survive daemon restarts. Default discovery hides them;
+use `client.agents.list({ filter: { includeBackground: true } })` to include them.
+Exact-ID handles work normally. See [workspace creation](./workspaces.md#create-a-fresh-workspace)
+for defaults and caller inheritance.
+
 ## Request structured output
 
 ```ts
@@ -139,6 +164,48 @@ const assessment = JSON.parse(result.lastMessage) as {
 ```
 
 Validate the parsed value in your application before using it as trusted input.
+
+## Read the current state of an agent
+
+```ts
+const agent = client.agents.ref("agent_01H8X...");
+await agent.refresh();
+
+if (agent.pendingPermissions?.length) {
+  console.log(`Waiting on ${agent.pendingPermissions.length} permission request(s)`);
+}
+console.log(agent.lastUsage?.totalCostUsd, agent.runtimeInfo?.sessionId);
+```
+
+The handle exposes `status`, `capabilities`, `availableModes`, `pendingPermissions`, `activeTurn`, `lastUsage`, `lastError`, `features`, `runtimeInfo`, `archivedAt`, `workspaceId`, and `cwd` as properties. All of them read the last snapshot the handle observed and never fetch.
+
+A handle from `ref()` has observed nothing, so every one of them is `null` until `refresh()`, `run()`, `waitForFinish()`, a timeline refetch, or `subscribe()` delivers a snapshot. Optional values in an observed snapshot also read as `null`. Use `current()` when you need the whole snapshot or need to distinguish those states.
+
+`subscribe()` is a local listener. An owned agent-directory observation supplies its updates:
+
+```ts
+const unsubscribe = agent.subscribe(() => {
+  if (agent.status === "error") console.error(agent.lastError);
+});
+const directory = await client.agents.list({ subscribe: {} });
+
+// When this view closes:
+unsubscribe();
+await directory.subscription.release();
+```
+
+## List the commands a session loaded
+
+```ts
+const { commands, error } = await agent.commands();
+if (error) throw new Error(error);
+
+const skills = commands.filter((command) => command.kind === "skill");
+```
+
+The answer comes from the running session, not from a directory scan, so it includes commands and skills built into the provider that never appear on disk. `kind` is the provider's own classification and is optional; treat a missing `kind` as unclassified rather than assuming `"command"`.
+
+A provider that cannot produce a list reports that in `error` and returns an empty `commands` array. The call does not reject.
 
 ## Archive or detach
 

@@ -1,13 +1,27 @@
+import { resolveDaemonVersion } from "./daemon-version.js";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import type { ChildProcess } from "node:child_process";
+import type { Query } from "@anthropic-ai/claude-agent-sdk";
+import { ClaudeAgentClient } from "./agent/providers/claude/agent.js";
 import http from "node:http";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { WebSocket } from "ws";
 
 import { createPaseoDaemon, parseListenString, type PaseoDaemonConfig } from "./bootstrap.js";
 import { loadConfig } from "./config.js";
+import {
+  FileBackedProjectRegistry,
+  FileBackedWorkspaceRegistry,
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
+} from "./workspace-registry.js";
+import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import { ensureAgentLoaded } from "./agent/agent-loading.js";
 import { AgentManagerShuttingDownError } from "./agent/agent-manager.js";
 import { hashDaemonPassword } from "./auth.js";
 import { generateLocalPairingOffer } from "./pairing-offer.js";
@@ -79,6 +93,66 @@ describe("paseo daemon bootstrap", () => {
     }
   });
 
+  test("keeps timeline activity in memory and removes obsolete timeline files at startup", async () => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-timeline-cleanup-"));
+    const paseoHome = path.join(paseoHomeRoot, ".paseo");
+    const obsoleteTimelineDirectory = path.join(paseoHome, "agent-timelines");
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-timeline-agent-"));
+    await mkdir(obsoleteTimelineDirectory, { recursive: true });
+    await writeFile(path.join(obsoleteTimelineDirectory, "obsolete.json"), "{}\n", "utf-8");
+
+    const daemonHandle = await createTestPaseoDaemon({ paseoHomeRoot, cleanup: false });
+    try {
+      await expect(access(obsoleteTimelineDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const agent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: agentCwd },
+        undefined,
+        { workspaceId: undefined },
+      );
+      await daemonHandle.daemon.agentManager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: "timeline stays in memory",
+      });
+      await daemonHandle.daemon.agentManager.flush();
+
+      await expect(access(obsoleteTimelineDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await daemonHandle.close();
+      await Promise.all([
+        rm(paseoHomeRoot, { recursive: true, force: true }),
+        rm(agentCwd, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  test("does not create a timeline directory for live timeline activity", async () => {
+    const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-timeline-memory-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-timeline-agent-"));
+    const daemonHandle = await createTestPaseoDaemon({ paseoHomeRoot, cleanup: false });
+    const timelineDirectory = path.join(daemonHandle.paseoHome, "agent-timelines");
+    try {
+      const agent = await daemonHandle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: agentCwd },
+        undefined,
+        { workspaceId: undefined },
+      );
+      await daemonHandle.daemon.agentManager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: "timeline stays in memory",
+      });
+      await daemonHandle.daemon.agentManager.flush();
+
+      await expect(access(timelineDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await daemonHandle.close();
+      await Promise.all([
+        rm(paseoHomeRoot, { recursive: true, force: true }),
+        rm(agentCwd, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
   test("reload applies live HTTP, MCP, Git, provider, relay, and app policies", async () => {
     const paseoHomeRoot = await mkdtemp(path.join(os.tmpdir(), "paseo-config-reload-runtime-"));
     const paseoHome = path.join(paseoHomeRoot, ".paseo");
@@ -111,6 +185,14 @@ describe("paseo daemon bootstrap", () => {
     config.agentClients = createTestAgentClients();
     config.agentStoragePath = path.join(paseoHome, "agents");
     config.isDev = true;
+    config.speech = {
+      providers: {
+        dictationStt: { provider: "local", explicit: true, enabled: false },
+        voiceTurnDetection: { provider: "local", explicit: true, enabled: false },
+        voiceStt: { provider: "local", explicit: true, enabled: false },
+        voiceTts: { provider: "local", explicit: true, enabled: false },
+      },
+    };
     const daemon = await createPaseoDaemon(config, pino({ level: "silent" }));
     let client: DaemonClient | null = null;
     let proxyUpstream: http.Server | null = null;
@@ -468,9 +550,12 @@ describe("paseo daemon bootstrap", () => {
         await enrollmentReleased;
         return {
           daemonId: input.daemonId,
-          scopes: input.scopes,
+          permissions: input.permissions,
           webSocketUrl: "wss://hub.test/daemon",
         };
+      },
+      async updatePermissions(input) {
+        return { permissions: input.permissions };
       },
       async revoke(_input: HubRevocation): Promise<void> {},
       openSocket(_input: HubSocketCredentials, _events: HubSocketEvents): HubSocketConnection {
@@ -601,10 +686,13 @@ describe("paseo daemon bootstrap", () => {
       await mkdir(pluginDirectory);
       await writeFile(
         path.join(pluginDirectory, "paseo-plugin.json"),
-        JSON.stringify({ id: "startup-rollback" }),
+        JSON.stringify({
+          id: "startup-rollback",
+          requirements: { paseo: `>=${resolveDaemonVersion(import.meta.url)}` },
+        }),
       );
       await writeFile(
-        path.join(pluginDirectory, "index.tsx"),
+        path.join(pluginDirectory, "index.server.ts"),
         `import { writeFileSync } from "node:fs";
 export default function contribute(plugin: unknown) {
   void plugin;
@@ -980,3 +1068,225 @@ function probeWebSocketConnection(
     });
   });
 }
+
+test("startup closes stale active records before serving status without resuming sessions", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paseo-stale-status-"));
+  const logger = pino({ level: "silent" });
+  const storagePath = path.join(root, ".paseo", "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const timestamp = "2025-01-01T00:00:00.000Z";
+  const registryDir = path.join(root, ".paseo", "projects");
+  await new FileBackedProjectRegistry(path.join(registryDir, "projects.json"), logger).upsert(
+    createPersistedProjectRecord({
+      projectId: "existing-project",
+      rootPath: root,
+      kind: "non_git",
+      displayName: "Existing",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }),
+  );
+  await new FileBackedWorkspaceRegistry(path.join(registryDir, "workspaces.json"), logger).upsert(
+    createPersistedWorkspaceRecord({
+      workspaceId: "existing-workspace",
+      projectId: "existing-project",
+      cwd: root,
+      kind: "directory",
+      displayName: "Existing",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }),
+  );
+  const records: StoredAgentRecord[] = ["running", "initializing", "idle", "error", "closed"].map(
+    (status, index) => ({
+      id: randomUUID(),
+      workspaceId: "existing-workspace",
+      provider: "codex",
+      cwd: root,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      updatedAt: "2025-01-02T00:00:00.000Z",
+      lastActivityAt: "2025-01-02T00:00:00.000Z",
+      lastStatus: status as StoredAgentRecord["lastStatus"],
+      title: `Keep ${status}`,
+      labels: { "paseo.parent-agent-id": "parent", custom: "keep" },
+      persistence: { provider: "codex", sessionId: `session-${index}` },
+      config: { modeId: "full-access" },
+      requiresAttention: true,
+      attentionReason: "permission",
+      attentionTimestamp: "2025-01-02T00:00:00.000Z",
+      archivedAt: index === 1 ? "2025-01-03T00:00:00.000Z" : null,
+    }),
+  );
+  for (const record of records) await storage.upsert(record);
+  let sessionsCreated = 0;
+  const handle = await createTestPaseoDaemon({
+    paseoHomeRoot: root,
+    agentClients: createTestAgentClients({
+      beforeCreateSession: async () => {
+        sessionsCreated++;
+      },
+    }),
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${handle.port}/ws` });
+  try {
+    const expected = records.map((record) => ({
+      ...record,
+      lastStatus:
+        record.lastStatus === "running" || record.lastStatus === "initializing"
+          ? "closed"
+          : record.lastStatus,
+    }));
+    expect(
+      (await handle.daemon.agentStorage.list()).sort((a, b) => a.id.localeCompare(b.id)),
+    ).toEqual(expected.sort((a, b) => a.id.localeCompare(b.id)));
+    // A fresh reader proves the repaired states were written, rather than projected only in memory.
+    expect(
+      (await new AgentStorage(storagePath, logger).list()).sort((a, b) => a.id.localeCompare(b.id)),
+    ).toEqual(expected);
+    expect(handle.daemon.agentManager.listAgents()).toEqual([]);
+    expect(sessionsCreated).toBe(0);
+    await client.connect();
+    const snapshot = await client.fetchAgents({ filter: { includeArchived: true } });
+    expect(
+      Object.fromEntries(snapshot.entries.map((entry) => [entry.agent.id, entry.agent.status])),
+    ).toEqual(Object.fromEntries(expected.map((record) => [record.id, record.lastStatus])));
+    const opened = await ensureAgentLoaded(records[0]!.id, {
+      agentManager: handle.daemon.agentManager,
+      agentStorage: handle.daemon.agentStorage,
+      logger,
+    });
+    expect(opened.id).toBe(records[0]!.id);
+    expect(opened.persistence?.sessionId).toBe("session-0");
+    expect(opened.lifecycle).toBe("idle");
+    await handle.daemon.agentManager.runAgent(opened.id, "hello");
+    expect(handle.daemon.agentManager.getAgent(opened.id)?.lifecycle).toBe("idle");
+  } finally {
+    await client.close();
+    await handle.close();
+  }
+}, 30_000);
+
+test.each(["reject", "stall"] as const)(
+  "shutdown closes Claude and its process despite a %s peer and stalled SDK handshake",
+  async (failure) => {
+    let child: ChildProcess | undefined;
+    let ready!: () => void;
+    const processReady = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    let finishStream!: () => void;
+    const streamFinished = new Promise<void>((resolve) => {
+      finishStream = resolve;
+    });
+    const never = new Promise<never>(() => {});
+    const claude = new ClaudeAgentClient({
+      logger: pino({ level: "silent" }),
+      resolveBinary: async () => process.execPath,
+      queryFactory: ({ options }) => {
+        child = options.spawnClaudeCodeProcess!({
+          command: process.execPath,
+          args: [
+            "-e",
+            "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+          ],
+          cwd: process.cwd(),
+          env: process.env,
+          signal: new AbortController().signal,
+        }) as ChildProcess;
+        child.stdout!.once("data", ready);
+        let initialized = false;
+        // An injected SDK adapter leaves an active turn and both close requests unanswered.
+        return {
+          async next() {
+            if (!initialized) {
+              initialized = true;
+              return {
+                done: false,
+                value: {
+                  type: "system",
+                  subtype: "init",
+                  session_id: "shutdown-session",
+                  permissionMode: "default",
+                },
+              };
+            }
+            await streamFinished;
+            return { done: true, value: undefined };
+          },
+          interrupt: () => never,
+          return: () => never,
+          close() {},
+          async supportedModels() {
+            return [];
+          },
+          async supportedCommands() {
+            return [];
+          },
+          async setPermissionMode() {},
+          async setModel() {},
+          async applyFlagSettings() {},
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        } as Query;
+      },
+    });
+    let armed = false;
+    let peerRunning!: () => void;
+    const peerReady = new Promise<void>((resolve) => {
+      peerRunning = resolve;
+    });
+    const peers = createTestAgentClients({
+      beforeTurnComplete: async () => {
+        peerRunning();
+        await streamFinished;
+      },
+      closeSession: async () => {
+        if (!armed) return;
+        if (failure === "reject") throw new Error("peer close rejected");
+        await never;
+      },
+    });
+    const handle = await createTestPaseoDaemon({ agentClients: { claude, codex: peers.codex } });
+    let stopped = false;
+    let run: Promise<unknown> | undefined;
+    let peerRun: Promise<unknown> | undefined;
+    try {
+      const agent = await handle.daemon.agentManager.createAgent(
+        { provider: "claude", cwd: handle.paseoHome },
+        undefined,
+        { workspaceId: undefined },
+      );
+      run = handle.daemon.agentManager.runAgent(agent.id, "keep working").catch(() => undefined);
+      await processReady;
+      expect(handle.daemon.agentManager.getAgent(agent.id)?.lifecycle).toBe("running");
+      const peer = await handle.daemon.agentManager.createAgent(
+        { provider: "codex", cwd: handle.paseoHome, modeId: "full-access" },
+        undefined,
+        { workspaceId: undefined },
+      );
+      peerRun = handle.daemon.agentManager.runAgent(peer.id, "keep working").catch(() => undefined);
+      await peerReady;
+      armed = true;
+      await handle.daemon.stop();
+      stopped = true;
+      // Windows taskkill is forceful on the first signal; POSIX escalates after SIGTERM.
+      expect(child!.exitCode !== null || child!.signalCode !== null).toBe(true);
+      expect((await handle.daemon.agentStorage.get(agent.id))?.lastStatus).toBe("closed");
+      expect(handle.daemon.agentManager.getAgent(agent.id)).toBeNull();
+      expect((await handle.daemon.agentStorage.get(peer.id))?.lastStatus).toBe("running");
+    } finally {
+      finishStream();
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+      }
+      if (!stopped) await handle.daemon.stop();
+      await Promise.all([run, peerRun]);
+      await rm(path.dirname(handle.paseoHome), { recursive: true, force: true });
+      await rm(handle.staticDir, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);

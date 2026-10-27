@@ -5,32 +5,27 @@ import { createValidatedPersistStorage } from "@/storage/validated-persist-stora
 import {
   buildReviewAttachmentSnapshot,
   buildReviewDraftKey,
-  buildReviewDraftScopeKey,
+  addReviewDraftComment,
+  saveReviewDraftComment,
+  clearSentReviewDraftComments,
+  getReviewDraftComments,
+  resetReviewDraftStore,
+  useReviewDraftStore,
 } from "./store";
 import {
   addCommentToState,
   clearReviewInState,
   deleteCommentFromState,
-  type DiffModeOverride,
-  expireStaleDiffModeOverridesInState,
   normalizePersistedState,
-  resolveDiffMode,
   type ReviewDraftComment,
   type ReviewDraftStoreState,
   serializeReviewDraftState,
   SerializedReviewDraftStateSchema,
-  setDiffModeOverrideInState,
   updateCommentInState,
 } from "./state";
 
 function emptyState(): ReviewDraftStoreState {
-  return { drafts: {}, diffModeOverrides: {} };
-}
-
-function makeOverride(
-  input: Pick<DiffModeOverride, "mode" | "isDirtyAtSelection">,
-): DiffModeOverride {
-  return { serverId: "server-1", cwd: "/repo", ...input };
+  return { drafts: {} };
 }
 
 function makeComment(overrides: Partial<ReviewDraftComment> = {}): ReviewDraftComment {
@@ -121,21 +116,6 @@ describe("buildReviewDraftKey", () => {
       }),
     ).toBe("review:server=local:cwd=%2Frepo:mode=base:base=main:ignoreWhitespace=false");
   });
-
-  it("builds a mode-free scope key for diff mode override sharing", () => {
-    const scope = buildReviewDraftScopeKey({
-      serverId: "local",
-      workspaceId: "workspace-1",
-      cwd: "/repo",
-      baseRef: "main",
-      ignoreWhitespace: false,
-    });
-
-    expect(scope).toBe(
-      "review:server=local:workspace=workspace-1:base=main:ignoreWhitespace=false",
-    );
-    expect(scope).not.toContain("mode=");
-  });
 });
 
 describe("normalizePersistedState", () => {
@@ -155,7 +135,6 @@ describe("normalizePersistedState", () => {
     const normalized = normalizePersistedState(stored?.state);
 
     expect(normalized.drafts["review:key"]).toEqual([makeComment()]);
-    expect(normalized.diffModeOverrides).toEqual({});
     expect(backing.values.has("@paseo:review-draft-store")).toBe(true);
   });
 
@@ -182,146 +161,25 @@ describe("normalizePersistedState", () => {
       },
     });
 
-    expect(normalized.diffModeOverrides).toEqual({});
     expect(normalized.drafts).toEqual({});
   });
 
   it("returns empty state for null, non-object, or malformed inputs", () => {
-    expect(normalizePersistedState(null)).toEqual({ drafts: {}, diffModeOverrides: {} });
-    expect(normalizePersistedState("nope")).toEqual({ drafts: {}, diffModeOverrides: {} });
-    expect(normalizePersistedState({ drafts: [] })).toEqual({
-      drafts: {},
-      diffModeOverrides: {},
-    });
+    expect(normalizePersistedState(null)).toEqual({ drafts: {} });
+    expect(normalizePersistedState("nope")).toEqual({ drafts: {} });
+    expect(normalizePersistedState({ drafts: [] })).toEqual({ drafts: {} });
   });
 });
 
 describe("serializeReviewDraftState", () => {
-  it("serialized output does not contain activeModesByScope or diffModeOverrides", () => {
-    const state = setDiffModeOverrideInState(
-      addCommentToState(emptyState(), { key: "review:key", comment: makeComment() }),
-      {
-        scopeKey: "review:scope",
-        override: makeOverride({ mode: "uncommitted", isDirtyAtSelection: true }),
-      },
-    );
+  it("serialized output does not contain the legacy activeModesByScope field", () => {
+    const state = addCommentToState(emptyState(), { key: "review:key", comment: makeComment() });
 
     const serialized = serializeReviewDraftState(state);
 
     expect(Object.keys(serialized)).toEqual(["drafts"]);
     expect("activeModesByScope" in serialized).toBe(false);
-    expect("diffModeOverrides" in serialized).toBe(false);
     expect(serialized.drafts["review:key"]).toHaveLength(1);
-  });
-});
-
-describe("diff mode override", () => {
-  it("resolves to auto mode from the dirty state when no override exists", () => {
-    expect(resolveDiffMode({ override: undefined, hasUncommittedChanges: true })).toBe(
-      "uncommitted",
-    );
-    expect(resolveDiffMode({ override: undefined, hasUncommittedChanges: false })).toBe("base");
-  });
-
-  it("honors the override while isDirty matches the value at selection, across remounts", () => {
-    const state = setDiffModeOverrideInState(emptyState(), {
-      scopeKey: "review:scope",
-      override: makeOverride({ mode: "base", isDirtyAtSelection: true }),
-    });
-
-    // Resolution is a plain store read, so it gives the same answer on every (re)mount.
-    const override = state.diffModeOverrides["review:scope"];
-    expect(resolveDiffMode({ override, hasUncommittedChanges: true })).toBe("base");
-  });
-
-  it("masks a stale override before its expiry lands", () => {
-    const state = setDiffModeOverrideInState(emptyState(), {
-      scopeKey: "review:scope",
-      override: makeOverride({ mode: "uncommitted", isDirtyAtSelection: true }),
-    });
-
-    const override = state.diffModeOverrides["review:scope"];
-    expect(resolveDiffMode({ override, hasUncommittedChanges: false })).toBe("base");
-  });
-
-  it("expires overrides for the checkout whose dirty state flipped, keeping the rest", () => {
-    let state = setDiffModeOverrideInState(emptyState(), {
-      scopeKey: "review:scope-a",
-      override: makeOverride({ mode: "base", isDirtyAtSelection: true }),
-    });
-    state = setDiffModeOverrideInState(state, {
-      scopeKey: "review:scope-b",
-      override: makeOverride({ mode: "uncommitted", isDirtyAtSelection: false }),
-    });
-    state = setDiffModeOverrideInState(state, {
-      scopeKey: "review:scope-other",
-      override: {
-        serverId: "server-2",
-        cwd: "/other",
-        mode: "base",
-        isDirtyAtSelection: true,
-      },
-    });
-
-    const next = expireStaleDiffModeOverridesInState(state, {
-      serverId: "server-1",
-      cwd: "/repo",
-      isDirty: false,
-    });
-
-    expect(next.diffModeOverrides["review:scope-a"]).toBeUndefined();
-    expect(next.diffModeOverrides["review:scope-b"]).toBeDefined();
-    expect(next.diffModeOverrides["review:scope-other"]).toBeDefined();
-  });
-
-  it("does not resurrect an expired override when the dirty state flips back", () => {
-    let state = setDiffModeOverrideInState(emptyState(), {
-      scopeKey: "review:scope",
-      override: makeOverride({ mode: "base", isDirtyAtSelection: true }),
-    });
-
-    // The checkout goes clean (e.g. agent commits): the override expires at the boundary.
-    state = expireStaleDiffModeOverridesInState(state, {
-      serverId: "server-1",
-      cwd: "/repo",
-      isDirty: false,
-    });
-    // The checkout goes dirty again: nothing to expire, and nothing comes back.
-    state = expireStaleDiffModeOverridesInState(state, {
-      serverId: "server-1",
-      cwd: "/repo",
-      isDirty: true,
-    });
-
-    expect(state.diffModeOverrides["review:scope"]).toBeUndefined();
-    expect(
-      resolveDiffMode({
-        override: state.diffModeOverrides["review:scope"],
-        hasUncommittedChanges: true,
-      }),
-    ).toBe("uncommitted");
-  });
-
-  it("keeps state identity when no override is stale", () => {
-    const state = setDiffModeOverrideInState(emptyState(), {
-      scopeKey: "review:scope",
-      override: makeOverride({ mode: "base", isDirtyAtSelection: true }),
-    });
-
-    expect(
-      expireStaleDiffModeOverridesInState(state, {
-        serverId: "server-1",
-        cwd: "/repo",
-        isDirty: true,
-      }),
-    ).toBe(state);
-    expect(
-      expireStaleDiffModeOverridesInState(emptyState(), {
-        serverId: "server-1",
-        cwd: "/repo",
-        isDirty: false,
-      }),
-    ).toEqual(emptyState());
   });
 });
 
@@ -454,4 +312,50 @@ describe("buildReviewAttachmentSnapshot", () => {
       },
     });
   });
+});
+
+describe("successful feedback cleanup", () => {
+  it("clears sent versions only, preserving edits, additions and other workspace drafts", () => {
+    resetReviewDraftStore();
+    const first = addReviewDraftComment({ key: "first", comment: makeComment() });
+    const edited = addReviewDraftComment({
+      key: "first",
+      comment: makeComment({ id: "edited", body: "Before send" }),
+    });
+    const other = addReviewDraftComment({ key: "other", comment: makeComment({ id: "other" }) });
+    useReviewDraftStore.getState().updateComment({
+      key: "first",
+      id: edited.id,
+      updates: { body: "After send" },
+      updatedAt: edited.updatedAt,
+    });
+    const added = addReviewDraftComment({ key: "first", comment: makeComment({ id: "added" }) });
+    clearSentReviewDraftComments({ key: "first", comments: [first, edited] });
+    expect(getReviewDraftComments("first")).toEqual([{ ...edited, body: "After send" }, added]);
+    expect(getReviewDraftComments("other")).toEqual([other]);
+    resetReviewDraftStore();
+  });
+});
+
+it("saves an acknowledged open edit as a new version and keeps subsequent edits on that record", () => {
+  resetReviewDraftStore();
+  const submitted = addReviewDraftComment({ key: "first", comment: makeComment() });
+  clearSentReviewDraftComments({ key: "first", comments: [submitted] });
+  saveReviewDraftComment({
+    key: "first",
+    id: submitted.id,
+    comment: { ...submitted, body: "Open edit after acknowledgement" },
+  });
+  const restored = getReviewDraftComments("first")![0]!;
+  expect(restored.body).toBe("Open edit after acknowledgement");
+  expect(restored.id).not.toBe(submitted.id);
+  clearSentReviewDraftComments({ key: "first", comments: [submitted] });
+  expect(getReviewDraftComments("first")).toEqual([restored]);
+  saveReviewDraftComment({
+    key: "first",
+    id: restored.id,
+    comment: { ...restored, body: "Saved again" },
+  });
+  expect(getReviewDraftComments("first")).toMatchObject([{ id: restored.id, body: "Saved again" }]);
+  resetReviewDraftStore();
 });

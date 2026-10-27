@@ -1,4 +1,5 @@
 import { test as base, expect, type Page } from "@playwright/test";
+import { hideDeveloperToasts } from "./developer-ui.mjs";
 import { startOutdatedDaemon, type OutdatedDaemon } from "./helpers/daemon-update";
 import { startE2EWorker } from "./helpers/e2e-worker";
 import { getE2EDaemonPort } from "./helpers/daemon-port";
@@ -32,23 +33,32 @@ const metroTest = base.extend({
   },
 });
 
-const test = metroTest.extend<
+const daemonTest = metroTest.extend<
+  { projectOwnership: void },
   {
-    paseoE2ESetup: void;
-    projectOwnership: void;
-    outdatedDaemon: OutdatedDaemon;
-    desktopManagedOutdatedDaemon: OutdatedDaemon;
-    relayConfigOutdatedDaemon: OutdatedDaemon;
-    projectPickerFixture: TrackedProjectPickerFixture;
-    withWorkspace: WithWorkspace;
-  },
-  { e2eForkProviders: string[]; e2eWorker: void; e2eWorkerClient: SeedDaemonClient }
+    e2eDaemonConfig: Record<string, unknown> | undefined;
+    e2eDaemonEnvironment: Record<string, string>;
+    e2eForkProviders: string[];
+    e2eInjectPaseoTools: boolean;
+    e2eWorker: void;
+    e2eWorkerClient: SeedDaemonClient;
+  }
 >({
   e2eForkProviders: [[], { scope: "worker", option: true }],
+  e2eInjectPaseoTools: [false, { scope: "worker", option: true }],
+  e2eDaemonConfig: [undefined, { scope: "worker", option: true }],
+  e2eDaemonEnvironment: [{}, { scope: "worker", option: true }],
   e2eWorker: [
-    async ({ e2eForkProviders }, provide, workerInfo) => {
+    async (
+      { e2eDaemonConfig, e2eDaemonEnvironment, e2eForkProviders, e2eInjectPaseoTools },
+      provide,
+      workerInfo,
+    ) => {
       const worker = await startE2EWorker(workerInfo.workerIndex, {
+        daemonConfig: e2eDaemonConfig,
+        environment: e2eDaemonEnvironment,
         forkProviders: e2eForkProviders,
+        injectPaseoTools: e2eInjectPaseoTools,
       });
       try {
         await provide();
@@ -94,6 +104,16 @@ const test = metroTest.extend<
     },
     { auto: true },
   ],
+});
+
+const test = daemonTest.extend<{
+  paseoE2ESetup: void;
+  outdatedDaemon: OutdatedDaemon;
+  desktopManagedOutdatedDaemon: OutdatedDaemon;
+  relayConfigOutdatedDaemon: OutdatedDaemon;
+  projectPickerFixture: TrackedProjectPickerFixture;
+  withWorkspace: WithWorkspace;
+}>({
   paseoE2ESetup: [
     async ({ page }, provide, testInfo) => {
       const daemonPort = getE2EDaemonPort();
@@ -110,6 +130,8 @@ const test = metroTest.extend<
       await page.routeWebSocket(/:(6767)\b/, async (ws) => {
         await ws.close({ code: 1008, reason: "Blocked connection to localhost:6767 during e2e." });
       });
+
+      await hideDeveloperToasts(page);
 
       const entries: string[] = [];
 
@@ -158,6 +180,11 @@ const test = metroTest.extend<
           localStorage.setItem("@paseo:daemon-registry", JSON.stringify([daemon, ...extraHosts]));
           localStorage.removeItem("@paseo:settings");
           localStorage.setItem("@paseo:create-agent-preferences", JSON.stringify(preferences));
+          // New installs collapse finished turns; specs assert on the rows inside them, so they
+          // start from the full chat unless they seed their own settings.
+          if (!localStorage.getItem("@paseo:app-settings")) {
+            localStorage.setItem("@paseo:app-settings", JSON.stringify({ chatDisplay: "full" }));
+          }
         },
         {
           daemon: testDaemon,
@@ -227,4 +254,4 @@ const test = metroTest.extend<
   },
 });
 
-export { test, metroTest, expect, type Page };
+export { daemonTest, test, metroTest, expect, type Page };

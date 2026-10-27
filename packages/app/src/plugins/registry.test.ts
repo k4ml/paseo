@@ -1,5 +1,41 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { pluginRegistry } from "./registry";
+import appPackage from "../../package.json";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { pluginRegistry as registry } from "./registry";
+
+const audio = { play: async () => 0 };
+
+vi.mock("./navigation", () => ({
+  createPluginNavigation: () => ({}),
+}));
+vi.mock("./client-runtime", () => ({
+  createPluginClientRuntime: () => ({
+    paseo: { dispose: async () => {} },
+    rpc: async () => undefined,
+    openSurface: () => undefined,
+    openPanel: () => undefined,
+    addComposerPill: () => ({ update() {}, remove() {} }),
+    addHeaderButton: () => ({ update() {}, remove() {} }),
+  }),
+}));
+
+const daemonClient = {} as DaemonClient;
+const pluginRegistry = {
+  getSnapshot: registry.getSnapshot,
+  subscribe: registry.subscribe,
+  removeHost: registry.removeHost.bind(registry),
+  installCatalog(
+    serverId: string,
+    catalog: Parameters<typeof registry.installCatalog>[1],
+    options: { replacePluginId?: string } = {},
+  ) {
+    return registry.installCatalog(
+      serverId,
+      catalog.map((entry) => ({ ...entry, requirements: { paseo: `>=${appPackage.version}` } })),
+      { ...options, client: daemonClient, audio },
+    );
+  },
+};
 
 function bundle(marker: string): string {
   return `(function() {
@@ -8,10 +44,29 @@ function bundle(marker: string): string {
       function Surface() { return ${JSON.stringify(marker)}; }
       plugin.addSurface("main", Surface);
       plugin.addSidebarItem({ id: "main", title: "Example", icon: "Blocks", surface: "main" });
+      plugin.addWorkspacePanel({ id: "review", title: "Review", icon: "Blocks", context: "workspace", Component: Surface });
+      plugin.addCommandCenterItem({ id: "open-review", title: "Open review", icon: "Blocks", context: "workspace", onSelect() {} });
       return function() { globalThis.__pluginCleanups = (globalThis.__pluginCleanups || 0) + 1; };
     };
     return module.exports;
   })`;
+}
+
+function timelineBundle(marker: string): string {
+  return `(function() {
+    return { default: function(plugin) {
+      plugin.addTimelineTransformer({
+        id: "report",
+        query: { itemType: "tool_call" },
+        transform() { return ${JSON.stringify(marker)} ? { items: [] } : undefined; },
+      });
+      return function() {};
+    } };
+  })`;
+}
+
+function installedPluginIds(): string[] {
+  return pluginRegistry.getSnapshot().map(({ id }) => id);
 }
 
 afterEach(() => {
@@ -21,6 +76,34 @@ afterEach(() => {
 });
 
 describe("PluginRegistry", () => {
+  it("publishes synchronous setup once after storing the installation", () => {
+    const snapshots: string[][] = [];
+    const unsubscribe = pluginRegistry.subscribe(() => {
+      snapshots.push(installedPluginIds());
+    });
+
+    pluginRegistry.installCatalog("host-a", [{ id: "example", clientBundle: bundle("one") }]);
+    unsubscribe();
+
+    expect(snapshots).toEqual([["example"]]);
+  });
+
+  it("reports timeline contribution changes", () => {
+    const first = timelineBundle("one");
+    expect(pluginRegistry.installCatalog("host-a", [{ id: "reports", clientBundle: first }])).toBe(
+      true,
+    );
+    expect(pluginRegistry.installCatalog("host-a", [{ id: "reports", clientBundle: first }])).toBe(
+      false,
+    );
+    expect(
+      pluginRegistry.installCatalog("host-a", [
+        { id: "reports", clientBundle: timelineBundle("two") },
+      ]),
+    ).toBe(true);
+    expect(pluginRegistry.installCatalog("host-a", [])).toBe(true);
+  });
+
   it("preserves a plugin query cache when the same bundle reconnects", () => {
     const clientBundle = bundle("one");
     pluginRegistry.installCatalog("host-a", [{ id: "example", clientBundle }]);
@@ -85,6 +168,8 @@ describe("PluginRegistry", () => {
 
     const second = pluginRegistry.getSnapshot()[0];
     expect(second).not.toBe(first);
+    expect(second?.workspacePanels.map((panel) => panel.id)).toEqual(["review"]);
+    expect(second?.commandCenterItems.map((item) => item.id)).toEqual(["open-review"]);
     expect(first?.queryClient.getQueryData(["attachment-search"])).toBeUndefined();
     expect(Reflect.get(globalThis, "__pluginCleanups")).toBe(1);
   });

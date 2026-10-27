@@ -1,7 +1,11 @@
 import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
-import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
-import type { ActiveTurnIdentity } from "@/timeline/turn-liveness";
+import { getParentAddressFromLabels } from "@getpaseo/protocol/agent-labels";
+import {
+  TURN_LIVENESS_IDLE,
+  type ActiveTurnIdentity,
+  type TurnLiveness,
+} from "@/timeline/turn-liveness";
 import type { Agent } from "@/stores/session-store";
 
 function normalizeActiveTurn(
@@ -18,13 +22,23 @@ function normalizeActiveTurn(
   return snapshot.status === "running" ? { turnId: null, startedAt: lastUserMessageAt } : null;
 }
 
+function normalizeTurn(
+  snapshot: AgentSnapshotPayload,
+  lastUserMessageAt: Date | null,
+): TurnLiveness {
+  const activeTurn = normalizeActiveTurn(snapshot, lastUserMessageAt);
+  return activeTurn
+    ? { phase: "open", ...activeTurn, cancellationRequestId: null }
+    : TURN_LIVENESS_IDLE;
+}
+
 function projectActiveTurn(agent: Agent): Pick<AgentSnapshotPayload, "activeTurn"> {
-  if (agent.activeTurn === null) return { activeTurn: null };
-  if (agent.activeTurn.turnId === null) return {};
+  if (agent.turn.phase === "idle") return { activeTurn: null };
+  if (agent.turn.turnId === null) return {};
   return {
     activeTurn: {
-      turnId: agent.activeTurn.turnId,
-      startedAt: agent.activeTurn.startedAt?.toISOString() ?? null,
+      turnId: agent.turn.turnId,
+      startedAt: agent.turn.startedAt?.toISOString() ?? null,
     },
   };
 }
@@ -84,18 +98,19 @@ export function normalizeAgentSnapshot(snapshot: AgentSnapshotPayload, serverId:
     ? new Date(snapshot.attentionTimestamp)
     : null;
   const archivedAt = snapshot.archivedAt ? new Date(snapshot.archivedAt) : null;
-  const parentAgentId = getParentAgentIdFromLabels(snapshot.labels);
+  const parent = getParentAddressFromLabels(snapshot.labels, serverId);
+  const parentAgentId = parent?.serverId === serverId ? parent.agentId : null;
   // COMPAT(agentTurnIdentity): added in v0.2.6, remove after 2027-01-31 once daemon floor >= v0.2.6.
   // Old daemons expose only status. Normalize that legacy signal once so the rest
   // of the app consumes one activity shape.
-  const activeTurn = normalizeActiveTurn(snapshot, lastUserMessageAt);
+  const turn = normalizeTurn(snapshot, lastUserMessageAt);
 
   return {
     serverId,
     id: snapshot.id,
     provider: snapshot.provider,
     status: snapshot.status,
-    activeTurn,
+    turn,
     createdAt,
     updatedAt,
     lastUserMessageAt,

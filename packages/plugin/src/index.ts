@@ -1,26 +1,31 @@
+// Shared SDK entry. Keep runtime-specific imports and re-exports on /client or /server.
+export type {
+  PluginTheme,
+  PluginWorkspaceSnapshot,
+  PluginAgentSnapshot,
+  PluginThemeColors,
+  PluginThemeContribution,
+  PluginAttachmentSourceContribution,
+  PluginTimelineData,
+  PluginTimelineItem,
+  PluginTimelineTransformResult,
+  PluginCleanup,
+} from "./contracts.js";
+export { defineSettings, settingsRpc, type SettingsDefinition } from "./settings.js";
 export {
+  defineAttachmentSource,
   PluginAttachmentItemSchema,
   PluginAttachmentSearchPayloadSchema,
   type PluginAttachmentItem,
   type PluginAttachmentSearchPayload,
 } from "./attachments.js";
-export type {
-  PluginAttachmentSourceContribution,
-  PluginCleanup,
-  PluginContribution,
-  PluginContext,
-  PluginHandlerContext,
-  PluginSidebarContribution,
-  PluginSurfaceContribution,
-  PluginSurfaceProps,
-} from "./contracts.js";
-export { usePaseo } from "./paseo-context.js";
-import type { PluginAttachmentSourceContribution } from "./contracts.js";
-export { useRpc } from "./rpc-context.js";
-export { defineRpc, type PluginRpcContract } from "./rpc.js";
+export { defineRpc, type PluginRpcContract, type RpcInput, type RpcOutput } from "./rpc.js";
 
-export function defineAttachmentSource<Definition extends PluginAttachmentSourceContribution>(
-  definition: Definition,
-): Definition {
-  return definition;
-}
+export type { PluginText, PluginMessage } from "./text.js";
+export {
+  findSvgIconProblem,
+  PLUGIN_SVG_ICON_MAX_BYTES,
+  type PluginIconProps,
+  type PluginSerializableIcon,
+  type PluginSvgIcon,
+} from "./icons.js";

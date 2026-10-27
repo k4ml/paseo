@@ -2,6 +2,9 @@ import { WebSocket } from "ws";
 import { z } from "zod";
 import type { WebSocketLike } from "../websocket-server.js";
 
+const SOCKET_PING_INTERVAL_MS = 10_000;
+const SOCKET_PONG_TIMEOUT_MS = 45_000;
+
 export interface HubEnrollment {
   daemonId: string;
   idempotencyKey: string;
@@ -11,13 +14,20 @@ export interface HubEnrollment {
   serverId: string;
   daemonPublicKey: string;
   credentialVerifier: string;
-  scopes: string[];
+  permissions: string[];
 }
 
 export interface HubEnrollmentResult {
   daemonId: string;
-  scopes: string[];
+  permissions: string[];
   webSocketUrl: string;
+}
+
+export interface HubPermissionUpdate {
+  daemonId: string;
+  hubOrigin: string;
+  credential: string;
+  permissions: string[];
 }
 
 export interface HubRevocation {
@@ -33,7 +43,7 @@ export interface HubSocketCredentials {
 }
 
 export interface HubSocketEvents {
-  connected(socket: WebSocketLike): void;
+  connected(socket: WebSocketLike, sessionProtocol: "legacy" | "session-v1"): void;
   rejected(statusCode: 401 | 403): void;
   closed(code: number): void;
   failed(error: Error): void;
@@ -45,6 +55,7 @@ export interface HubSocketConnection {
 
 export interface HubRelationshipRemote {
   enroll(input: HubEnrollment): Promise<HubEnrollmentResult>;
+  updatePermissions(input: HubPermissionUpdate): Promise<{ permissions: string[] }>;
   revoke(input: HubRevocation): Promise<void>;
   openSocket(input: HubSocketCredentials, events: HubSocketEvents): HubSocketConnection;
 }
@@ -58,7 +69,7 @@ export class HubEnrollmentRejectedError extends Error {
 
 const EnrollmentResultSchema = z.object({
   daemonId: z.string(),
-  scopes: z.array(z.string()),
+  permissions: z.array(z.string()),
   webSocketUrl: z
     .string()
     .url()
@@ -101,7 +112,7 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
           serverId: input.serverId,
           daemonPublicKey: input.daemonPublicKey,
           credentialVerifier: input.credentialVerifier,
-          scopes: input.scopes,
+          permissions: input.permissions,
         }),
         signal,
       });
@@ -114,6 +125,25 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
       const enrollment = EnrollmentResultSchema.parse(await response.json());
       ensureWebSocketMatchesHubOrigin(input.hubOrigin, enrollment.webSocketUrl);
       return enrollment;
+    });
+  }
+
+  async updatePermissions(input: HubPermissionUpdate): Promise<{ permissions: string[] }> {
+    return this.withRequestTimeout(async (signal) => {
+      const response = await fetch(
+        `${input.hubOrigin}/api/daemons/${encodeURIComponent(input.daemonId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${input.credential}`,
+          },
+          body: JSON.stringify({ permissions: input.permissions }),
+          signal,
+        },
+      );
+      if (!response.ok) throw new Error(`Hub permission update failed (${response.status})`);
+      return z.object({ permissions: z.array(z.string()) }).parse(await response.json());
     });
   }
 
@@ -134,16 +164,52 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
   }
 
   openSocket(input: HubSocketCredentials, events: HubSocketEvents): HubSocketConnection {
+    let sessionProtocol: "legacy" | "session-v1" = "legacy";
     const socket = new WebSocket(input.webSocketUrl, {
       handshakeTimeout: this.requestTimeoutMs,
       headers: {
         authorization: `Bearer ${input.credential}`,
         "x-paseo-daemon-id": input.daemonId,
+        "x-paseo-session-protocol": "1",
       },
     });
     let settled = false;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const stopHeartbeat = () => {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      stopHeartbeat();
+      socket.terminate();
+      events.failed(error);
+    };
+    let lastPongAt = 0;
+    socket.on("pong", () => {
+      lastPongAt = Date.now();
+    });
+    socket.once("upgrade", (response) => {
+      if (response.headers["x-paseo-session-protocol"] === "1") {
+        sessionProtocol = "session-v1";
+      }
+    });
     socket.once("open", () => {
-      if (!settled) events.connected(socket as WebSocketLike);
+      if (settled) return;
+      lastPongAt = Date.now();
+      heartbeat = setInterval(() => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastPongAt >= SOCKET_PONG_TIMEOUT_MS) {
+          fail(new Error("Hub WebSocket heartbeat timed out"));
+          return;
+        }
+        socket.ping(undefined, undefined, (error) => {
+          if (error) fail(error);
+        });
+      }, SOCKET_PING_INTERVAL_MS);
+      heartbeat.unref?.();
+      events.connected(socket as WebSocketLike, sessionProtocol);
     });
     socket.once("unexpected-response", (_request, response) => {
       if (settled) {
@@ -160,16 +226,12 @@ export class DirectHubRelationshipRemote implements HubRelationshipRemote {
       events.closed(1006);
     });
     socket.once("close", (code) => {
+      stopHeartbeat();
       if (settled) return;
       settled = true;
       events.closed(code);
     });
-    socket.once("error", (error) => {
-      if (settled) return;
-      settled = true;
-      socket.terminate();
-      events.failed(error);
-    });
+    socket.once("error", fail);
     return socket;
   }
 

@@ -25,7 +25,7 @@ function userMessage(id: string, seed: number): Extract<StreamItem, { kind: "use
 function assistantMessage(
   id: string,
   seed: number,
-  block?: { groupId: string; index: number },
+  _block?: { groupId: string; index: number },
   turnId?: string,
 ): Extract<StreamItem, { kind: "assistant_message" }> {
   return {
@@ -33,7 +33,6 @@ function assistantMessage(
     id,
     text: id,
     timestamp: timestamp(seed),
-    ...(block ? { blockGroupId: block.groupId, blockIndex: block.index } : {}),
     ...(turnId ? { turnId } : {}),
   };
 }
@@ -73,7 +72,6 @@ function thought(id: string, seed: number): Extract<StreamItem, { kind: "thought
 
 function timingFor(...ids: string[]): Map<string, TurnTiming> {
   const timing = {
-    startedAt: timestamp(1),
     completedAt: timestamp(9),
     durationMs: 8000,
   };
@@ -150,7 +148,7 @@ function findLayoutItem(layout: StreamLayout, id: string): StreamLayoutItem {
 }
 
 describe("layoutStream", () => {
-  it("does not borrow an assistant footer across adjacent tagged tool-only turns", () => {
+  it("places one response footer after an adjacent tagged tool-only turn", () => {
     const priorAssistant = assistantMessage("prior", 1, undefined, "turn-1");
     const nextTool = toolCall("next-tool", 2, "turn-2");
     const layout = layoutFor({
@@ -159,14 +157,14 @@ describe("layoutStream", () => {
       timingIds: [priorAssistant.id],
     });
 
-    expect(layout.auxiliaryTurnFooter).toBeNull();
+    expect(layout.auxiliaryTurnFooter?.itemId).toBe(priorAssistant.id);
     expect(footerOwners(layout)).toEqual([priorAssistant.id]);
   });
 
   it("recomputes cached history layout when only the live boundary turn changes", () => {
     const priorAssistant = assistantMessage("prior", 1, undefined, "turn-1");
     const history = [priorAssistant];
-    const liveHead = [toolCall("live-tool", 2, "turn-1")];
+    const liveHead: StreamItem[] = [{ ...userMessage("live-user", 2), turnId: "turn-1" }];
     const strategy = strategyFor("web");
     const first = layoutStream({
       strategy,
@@ -319,7 +317,7 @@ describe("layoutStream", () => {
     expect(assistantRow.frameOrder).toBe("content-then-footer");
   });
 
-  it("compacts assistant block spacing across the history and live-head boundary", () => {
+  it("keeps separate messages spaced across history and the live head", () => {
     const historyBlock = assistantMessage("turn:block:0", 2, { groupId: "turn", index: 0 });
     const headBlock = assistantMessage("turn:head", 3, { groupId: "turn", index: 1 });
     const layout = layoutFor({
@@ -329,8 +327,8 @@ describe("layoutStream", () => {
       timingIds: [historyBlock.id, headBlock.id],
     });
 
-    expect(findLayoutItem(layout, historyBlock.id).assistantSpacing).toBe("compactBottom");
-    expect(findLayoutItem(layout, headBlock.id).assistantSpacing).toBe("compactTop");
+    expect(findLayoutItem(layout, historyBlock.id).assistantSpacing).toBe("default");
+    expect(findLayoutItem(layout, headBlock.id).assistantSpacing).toBe("compactBottom");
   });
 
   it.each(["web", "android"] as const)(
@@ -365,6 +363,23 @@ describe("layoutStream", () => {
       );
     },
   );
+
+  it("keeps layout item identity for rows whose layout did not change", () => {
+    const user = userMessage("u1", 1);
+    const first = toolCall("tool-1", 2);
+    const second = toolCall("tool-2", 3);
+    const before = layoutFor({ platform: "android", tail: [user, first, second] });
+
+    const third = toolCall("tool-3", 4);
+    const after = layoutFor({ platform: "android", tail: [user, first, second, third] });
+
+    // A newest-first list shifts every index, but only the rows next to the insertion change.
+    expect(findLayoutItem(after, user.id)).toBe(findLayoutItem(before, user.id));
+    expect(findLayoutItem(after, first.id)).toBe(findLayoutItem(before, first.id));
+    expect(findLayoutItem(after, second.id)).not.toBe(findLayoutItem(before, second.id));
+    expect(findLayoutItem(after, second.id).isLastInToolSequence).toBe(false);
+    expect(findLayoutItem(after, third.id).isLastInToolSequence).toBe(true);
+  });
 
   it("computes tool sequence position from strategy-aware neighbors", () => {
     const shell = toolCall("tool-1", 2);

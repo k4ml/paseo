@@ -5,18 +5,68 @@ import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 
 import {
   normalizeWorkspaceDescriptor,
+  selectAgentSentMessages,
   selectAgentTurnPresentation,
   selectAgentTimelineState,
   useSessionStore,
+  type Agent,
   type WorkspaceDescriptor,
 } from "./session-store";
 import type { StreamItem } from "../types/stream";
-import { patchWorkspaceScripts } from "../contexts/session-workspace-scripts";
+import { reduceTurnLiveness, type TurnLivenessTransition } from "@/timeline/turn-liveness";
+
+function createTestAgent(agentId: string): Agent {
+  return {
+    serverId: "test-server",
+    id: agentId,
+    provider: "codex",
+    status: "idle",
+    turn: { phase: "idle", cancellationRequestId: null },
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    lastUserMessageAt: null,
+    lastActivityAt: new Date(0),
+    capabilities: {
+      supportsStreaming: true,
+      supportsSessionPersistence: true,
+      supportsDynamicModes: false,
+      supportsMcpServers: false,
+      supportsReasoningStream: false,
+      supportsToolInvocations: false,
+    },
+    currentModeId: null,
+    availableModes: [],
+    pendingPermissions: [],
+    persistence: null,
+    title: null,
+    cwd: "/repo",
+    model: null,
+    parentAgentId: null,
+    labels: {},
+  };
+}
+
+function applyTestTurn(
+  serverId: string,
+  agentId: string,
+  transition: TurnLivenessTransition | readonly TurnLivenessTransition[],
+): void {
+  useSessionStore.getState().setAgents(serverId, (agents) => {
+    const agent = agents.get(agentId) ?? createTestAgent(agentId);
+    const transitions = Array.isArray(transition) ? transition : [transition];
+    const turn = transitions.reduce(reduceTurnLiveness, agent.turn);
+    const next = new Map(agents);
+    next.set(agentId, { ...agent, status: turn.phase === "open" ? "running" : "idle", turn });
+    return next;
+  });
+}
 
 function createWorkspace(
   input: Partial<WorkspaceDescriptor> & Pick<WorkspaceDescriptor, "id">,
 ): WorkspaceDescriptor {
   return {
+    createdAt: null,
+    lastUserMessageAt: null,
     id: input.id,
     projectId: input.projectId ?? "project-1",
     projectDisplayName: input.projectDisplayName ?? "Project 1",
@@ -186,6 +236,25 @@ describe("agent timeline state", () => {
     ).toEqual({ status: "synced", items: [], range: null, older: "none", newer: "none" });
   });
 
+  it("lists sent messages newest first, including the live head", () => {
+    initializeTestSession();
+    const sent = (id: string, text: string) => ({ ...submittedMessage(id), text });
+    useSessionStore.getState().applyAgentTimelineResponseState("test-server", "agent-1", {
+      items: [sent("m1", "fix the auth bug"), sent("m2", "add tests"), sent("m3", "add tests")],
+      head: [sent("m4", "  "), sent("m5", "refactor the wrong module")],
+      range: { epoch: "epoch-1", startSeq: 1, endSeq: 5 },
+      older: "none",
+      newer: false,
+      synchronized: true,
+      acknowledgedClientMessageIds: [],
+    });
+
+    expect(
+      selectAgentSentMessages(useSessionStore.getState().sessions["test-server"], "agent-1"),
+    ).toEqual(["refactor the wrong module", "add tests", "fix the auth bug"]);
+    expect(selectAgentSentMessages(undefined, "agent-1")).toEqual([]);
+  });
+
   it("preserves older availability when an applied response leaves it unchanged", () => {
     initializeTestSession();
     const store = useSessionStore.getState();
@@ -223,22 +292,25 @@ describe("agent timeline state", () => {
   it("stores turn liveness transitions without duplicating their policy", () => {
     initializeTestSession();
     const store = useSessionStore.getState();
-    store.applyAgentTurnLiveness("test-server", "agent-1", {
+    applyTestTurn("test-server", "agent-1", {
       type: "snapshot",
       activeTurn: { turnId: "turn-1", startedAt: null },
     });
-    expect(store.getSession("test-server")?.agentTurnLiveness.get("agent-1")).toEqual({
+    expect(store.getSession("test-server")?.agents.get("agent-1")?.turn).toEqual({
       phase: "open",
       turnId: "turn-1",
       startedAt: null,
       cancellationRequestId: null,
     });
 
-    store.applyAgentTurnLiveness("test-server", "agent-1", {
+    applyTestTurn("test-server", "agent-1", {
       type: "snapshot",
       activeTurn: null,
     });
-    expect(store.getSession("test-server")?.agentTurnLiveness.has("agent-1")).toBe(false);
+    expect(store.getSession("test-server")?.agents.get("agent-1")?.turn).toEqual({
+      phase: "idle",
+      cancellationRequestId: null,
+    });
   });
 });
 
@@ -268,27 +340,27 @@ describe("message submission ordering", () => {
       return;
     }
     if (step === "stream-open") {
-      store.applyAgentTurnLiveness("test-server", agentId, {
+      applyTestTurn("test-server", agentId, {
         type: "stream_open",
         turn: { turnId: "turn-1", startedAt },
       });
       return;
     }
     if (step === "snapshot-open") {
-      store.applyAgentTurnLiveness("test-server", agentId, {
+      applyTestTurn("test-server", agentId, {
         type: "snapshot",
         activeTurn: { turnId: "turn-1", startedAt },
       });
       return;
     }
     if (step === "snapshot-idle") {
-      store.applyAgentTurnLiveness("test-server", agentId, {
+      applyTestTurn("test-server", agentId, {
         type: "snapshot",
         activeTurn: null,
       });
       return;
     }
-    store.applyAgentTurnLiveness("test-server", agentId, {
+    applyTestTurn("test-server", agentId, {
       type: "stream_close",
       turnId: "turn-1",
     });
@@ -323,7 +395,7 @@ describe("message submission ordering", () => {
       store.setAgentStreamState("test-server", agentId, {
         acknowledgedClientMessageIds: [clientMessageId],
       });
-      store.applyAgentTurnLiveness("test-server", agentId, [
+      applyTestTurn("test-server", agentId, [
         { type: "stream_close", turnId: "turn-1" },
         { type: "snapshot", activeTurn: null },
       ]);
@@ -748,31 +820,5 @@ describe("removeWorkspace", () => {
     expect(after.sessions).toBe(before.sessions);
     expect(after.session).toBe(before.session);
     expect(after.workspaces).toBe(before.workspaces);
-  });
-});
-
-describe("patchWorkspaceScripts", () => {
-  it("preserves workspace entry identity when scripts are content-equal", () => {
-    const script = {
-      scriptName: "web",
-      type: "service" as const,
-      hostname: "web.paseo.localhost",
-      port: 3000,
-      proxyUrl: "http://web.paseo.localhost:6767",
-      lifecycle: "running" as const,
-      health: "healthy" as const,
-      exitCode: null,
-      terminalId: null,
-    };
-    const workspace = createWorkspace({ id: "/repo/main", scripts: [script] });
-    const current = new Map([[workspace.id, workspace]]);
-
-    const next = patchWorkspaceScripts(current, {
-      workspaceId: workspace.id,
-      scripts: [{ ...script }],
-    });
-
-    expect(next).toBe(current);
-    expect(next.get(workspace.id)).toBe(workspace);
   });
 });

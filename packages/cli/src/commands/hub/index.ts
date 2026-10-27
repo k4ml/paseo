@@ -15,10 +15,12 @@ import { createCliLoginFlow, type CliLoginFlow } from "./login-flow.js";
 import { addHubLoginCommand } from "./login.js";
 import { addHubLogoutCommand, productionLogoutPrompt } from "./logout.js";
 import { addHubProjectsCommand } from "./projects.js";
+import { addHubExportCommand } from "./export.js";
 import { processHubReporter, type HubReporter } from "./reporter.js";
 import { hubStatusResult } from "./status-output.js";
 import { addHubResolutionHelp } from "./help.js";
-import { addHubInitCommand } from "./init.js";
+import { addHubInitCommand, continueHubGuidedSetup } from "./init.js";
+import { addHubPermissionsCommand } from "./permissions.js";
 
 interface HubCommandEnvironment {
   env: Readonly<Record<string, string | undefined>>;
@@ -56,6 +58,9 @@ export function createHubCommand(overrides: Partial<HubCommandEnvironment> = {})
     credentials: environment.credentials,
     flow: environment.login,
     reporter: environment.reporter,
+    isInteractive: environment.isInteractive,
+    continueGuidedSetup: (origin, daemonTarget) =>
+      continueHubGuidedSetup(origin, { ...environment, daemonTarget }),
   });
   addHubInitCommand(hub, environment);
   addHubConnectCommand(hub, {
@@ -67,8 +72,11 @@ export function createHubCommand(overrides: Partial<HubCommandEnvironment> = {})
   });
   addJsonAndDaemonHostOptions(hub.command("status")).action(
     withOutput(async (...args) => {
-      const options = args.at(-2) as { host?: string };
-      return withHubDaemon(environment.daemon, options.host, async (client) =>
+      const options = args.at(-2) as {
+        host?: string;
+        daemonTarget: import("../../utils/daemon-target.js").DaemonTarget;
+      };
+      return withHubDaemon(environment.daemon, options.daemonTarget, async (client) =>
         hubStatusResult((await client.getHubStatus()).status),
       );
     }),
@@ -77,11 +85,22 @@ export function createHubCommand(overrides: Partial<HubCommandEnvironment> = {})
     daemon: environment.daemon,
     reporter: environment.reporter,
   });
+  addHubPermissionsCommand(hub, {
+    daemon: environment.daemon,
+    reporter: environment.reporter,
+  });
   addHubProjectsCommand(hub, {
     env: environment.env,
     credentials: environment.credentials,
     hub: environment.hub,
     reporter: environment.reporter,
+  });
+  addHubExportCommand(hub, {
+    env: environment.env,
+    credentials: environment.credentials,
+    hub: environment.hub,
+    reporter: environment.reporter,
+    cwd: environment.cwd,
   });
   addHubDeployCommand(hub, {
     env: environment.env,

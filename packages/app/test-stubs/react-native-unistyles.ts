@@ -1,12 +1,24 @@
+import { lightHighlightColors } from "@getpaseo/highlight";
+
 const testTheme = {
   colorScheme: "light",
   colors: {
+    syntax: lightHighlightColors,
     foreground: "#111111",
     foregroundMuted: "#666666",
     statusSuccess: "#15803d",
     statusDanger: "#b91c1c",
     statusWarning: "#d97706",
     statusMerged: "#7c3aed",
+    // Same rule as the real theme: the status color at 12%.
+    statusSuccessTint: "#15803d1f",
+    statusDangerTint: "#b91c1c1f",
+    statusWarningTint: "#d977061f",
+    // The light band's values, so a test can name the colour it expects.
+    statusDotSuccess: "#299f51",
+    statusDotDanger: "#f12e2f",
+    statusDotWarning: "#b37824",
+    statusDotRunning: "#268ae0",
     accent: "#2563eb",
     accentForeground: "#ffffff",
     destructive: "#dc2626",
@@ -19,6 +31,7 @@ const testTheme = {
     palette: {
       amber: { 500: "#f59e0b" },
       blue: { 300: "#93c5fd" },
+      green: { 500: "#22c55e" },
       red: { 300: "#fca5a5" },
       white: "#ffffff",
     },
@@ -45,8 +58,28 @@ const testTheme = {
     xl: 12,
     full: 9999,
   },
-  iconSize: { sm: 16 },
+  iconSize: { sm: 16, md: 20 },
   opacity: { 50: 0.5 },
+  shadow: {
+    sm: {
+      shadowColor: "rgba(0, 0, 0, 0.02)",
+      shadowOffset: { width: 0, height: 2 },
+      shadowRadius: 8,
+      elevation: 2,
+    },
+    md: {
+      shadowColor: "rgba(0, 0, 0, 0.04)",
+      shadowOffset: { width: 0, height: 4 },
+      shadowRadius: 16,
+      elevation: 4,
+    },
+    lg: {
+      shadowColor: "rgba(0, 0, 0, 0.08)",
+      shadowOffset: { width: 0, height: 8 },
+      shadowRadius: 24,
+      elevation: 8,
+    },
+  },
 };
 
 type StyleFactory<T> = (theme: typeof testTheme) => T;

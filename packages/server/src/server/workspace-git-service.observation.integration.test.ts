@@ -1,13 +1,15 @@
+import { createWorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type pino from "pino";
+import pino from "pino";
 import { afterEach, expect, test, vi } from "vitest";
 import type { CheckoutSnapshotFacts, CheckoutStatusGit } from "../utils/checkout-git.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import { createFileObserver } from "./file-observer/index.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
-import type { FileChange, SubscribeToFileChanges } from "./file-observer/index.js";
+import type { FileChange, FileObserver, SubscribeToFileChanges } from "./file-observer/index.js";
 
 function createLogger(): pino.Logger {
   const logger = {
@@ -61,6 +63,27 @@ afterEach(async () => {
     await cleanup.pop()?.();
   }
 });
+
+test("a fresh checkout read makes a newly initialized repository available to cached readers", async () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-checkout-init-")));
+  const repo = path.join(root, "repo");
+  mkdirSync(repo);
+  const service = new WorkspaceGitServiceImpl({
+    logger: pino({ enabled: false }),
+    paseoHome: path.join(root, "home"),
+  });
+  cleanup.push(async () => {
+    await service.dispose();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  expect((await service.getSnapshot(repo, { includeForge: false })).git.isGit).toBe(false);
+  execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "pipe" });
+
+  expect((await service.getCheckout(repo)).isGit).toBe(true);
+  const repoRoot = await service.resolveRepoRoot(repo);
+  expect(realpathSync.native(repoRoot)).toBe(realpathSync.native(repo));
+}, 30_000);
 
 test("recursive observation updates tracked state and prunes ignored storms", async () => {
   const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-git-observation-")));
@@ -182,7 +205,10 @@ test("recursive observation updates tracked state and prunes ignored storms", as
       runGitCommand,
     } as never,
   });
+  const workspaceRuntimeStore = createWorkspaceRuntimeStore();
+  service.onSnapshotUpdated((snapshot) => workspaceRuntimeStore.set(snapshot));
   const diffManager = new CheckoutDiffManager({
+    workspaceRuntimeStore: workspaceRuntimeStore,
     logger: createLogger(),
     paseoHome: path.join(tempDir, "paseo-home"),
     workspaceGitService: service,
@@ -207,7 +233,7 @@ test("recursive observation updates tracked state and prunes ignored storms", as
   await vi.waitFor(
     () => {
       expect(activeWatcherCount).toBe(2);
-      expect(service.peekSnapshot(repoDir)).not.toBeNull();
+      expect(workspaceRuntimeStore.get(repoDir)).not.toBeNull();
       expect(service.getMetrics()).toMatchObject({
         workspaceObservationSetupInFlightCount: 0,
         workspaceRefreshInFlightCount: 0,
@@ -413,3 +439,270 @@ test("recursive observation updates tracked state and prunes ignored storms", as
   expect(getCheckoutDiff).not.toHaveBeenCalled();
   expect(service.getMetrics().workspaceRefreshQueuedCount).toBe(0);
 }, 30_000);
+
+test("a late Git-ignored tree is pruned while tracked changes still notify consumers", async () => {
+  const tempDir = realpathSync(mkdtempSync(path.join(tmpdir(), "paseo-real-ignore-")));
+  const repoDir = path.join(tempDir, "repo");
+  mkdirSync(repoDir);
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: repoDir, encoding: "utf8" }).trim();
+  git("init", "-q");
+  writeFileSync(path.join(repoDir, ".gitignore"), "node_modules/\n");
+  const trackedPath = path.join(repoDir, "tracked.txt");
+  writeFileSync(trackedPath, "before\n");
+  git("add", ".gitignore", "tracked.txt");
+  git("-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "fixture");
+
+  const observer = createFileObserver();
+  const ignoredDir = path.join(repoDir, "node_modules");
+  const completedIgnoreUpdates: string[][] = [];
+  let notifications = 0;
+  let expectTrackedEdit = false;
+  let trackedBatchReachedConsumer = false;
+  // Observe the real subscription without replacing Git, filesystem, or watcher behavior.
+  const fileObserver: FileObserver = {
+    subscribe: async (directory, callback, options) => {
+      const realSubscription = await observer.subscribe(
+        directory,
+        (error, events) => {
+          const includesTrackedEdit =
+            expectTrackedEdit && events.some((e) => e.path === trackedPath);
+          const before = notifications;
+          callback(error, events);
+          if (includesTrackedEdit && notifications > before) trackedBatchReachedConsumer = true;
+        },
+        options,
+      );
+      return {
+        updateIgnore: async (paths) => {
+          await realSubscription.updateIgnore(paths);
+          completedIgnoreUpdates.push([...paths]);
+        },
+        unsubscribe: () => realSubscription.unsubscribe(),
+      };
+    },
+    getDiagnostics: () => observer.getDiagnostics(),
+    close: () => observer.close(),
+  };
+  const service = new WorkspaceGitServiceImpl({
+    logger: pino({ enabled: false }),
+    paseoHome: path.join(tempDir, "home"),
+    fileObserver,
+  });
+  let subscription: Awaited<ReturnType<typeof service.requestWorkingTreeWatch>> | undefined;
+  try {
+    subscription = await service.requestWorkingTreeWatch(repoDir, () => {
+      notifications += 1;
+    });
+    for (let index = 0; index < 20; index += 1) {
+      const directory = path.join(ignoredDir, `dependency-${index}`);
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(path.join(directory, "index.js"), "first");
+    }
+    expect(git("ls-files", "-o", "-i", "--directory", "--exclude-standard")).toBe("node_modules/");
+    await expect
+      .poll(() => completedIgnoreUpdates.some((paths) => paths.includes(ignoredDir)), {
+        timeout: 5_000,
+      })
+      .toBe(true);
+
+    const atIgnoreBoundary = observer.getDiagnostics();
+    for (let index = 0; index < 20; index += 1) {
+      writeFileSync(path.join(ignoredDir, `dependency-${index}`, "second.js"), "second");
+    }
+    expectTrackedEdit = true;
+    writeFileSync(trackedPath, "after\n");
+    await expect.poll(() => trackedBatchReachedConsumer, { timeout: 5_000 }).toBe(true);
+    const afterTrackedEdit = observer.getDiagnostics();
+    expect(afterTrackedEdit.nativeHandleCount).toBe(atIgnoreBoundary.nativeHandleCount);
+    expect(afterTrackedEdit.nativeTrackedFileCount).toBe(atIgnoreBoundary.nativeTrackedFileCount);
+    expect(
+      afterTrackedEdit.nativeClassificationCount - atIgnoreBoundary.nativeClassificationCount,
+    ).toBeLessThanOrEqual(1);
+  } finally {
+    subscription?.unsubscribe();
+    await service.dispose();
+    await observer.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+}, 15_000);
+
+test("Git refresh, command tracing and 10,000 ignored alias events do no synchronous IO", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { fileURLToPath } = await import("node:url");
+  const repositoryRoot = fileURLToPath(new URL("../../../../", import.meta.url));
+  const source = `
+    import assert from 'node:assert/strict';
+    import { write } from 'node:fs';
+    import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
+    import { tmpdir } from 'node:os';
+    import { join } from 'node:path';
+    import { setImmediate as tick } from 'node:timers/promises';
+    import { createHook } from 'node:async_hooks';
+    import pino from 'pino';
+    import { WorkspaceGitServiceImpl } from './packages/server/src/server/workspace-git-service.ts';
+    import { runGitCommand } from './packages/server/src/utils/run-git-command.ts';
+    import { writePaseoWorktreeMetadata } from './packages/server/src/utils/worktree-metadata.ts';
+    const root = await mkdtemp(join(tmpdir(), 'git-async-contract-'));
+    const home = join(root, 'home');
+    const repo = join(root, 'repo');
+    const worktree = join(home, 'worktrees', 'project', 'topic');
+    const alias = join(root, 'alias');
+    const logger = pino({ level: 'trace' }, { write() {} });
+    // Async descriptor writes avoid Windows stderr's synchronous stream API.
+    const marker = (label) => new Promise((resolve, reject) => {
+      write(2, label + '\\n', (error) => error ? reject(error) : resolve());
+    });
+    let callback;
+    let notifications = 0;
+    const service = new WorkspaceGitServiceImpl({ logger, paseoHome: home, deps: {
+      subscribe: async (_root, onChange) => {
+        callback = onChange;
+        return { updateIgnore: async () => {}, unsubscribe: async () => {} };
+      }
+    } });
+    try {
+      await mkdir(repo);
+      await runGitCommand(['init', '-b', 'main'], { cwd: repo });
+      await runGitCommand(['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-m', 'base'], { cwd: repo });
+      await mkdir(join(home, 'worktrees', 'project'), { recursive: true });
+      await runGitCommand(['worktree', 'add', '-b', 'topic', worktree], { cwd: repo });
+      await writePaseoWorktreeMetadata(worktree, { baseRefName: 'main' });
+      await writeFile(join(worktree, '.gitignore'), 'ignored/\\n');
+      await mkdir(join(worktree, 'ignored'));
+      await writeFile(join(worktree, 'ignored', 'noise'), 'noise');
+      await symlink(worktree, alias, process.platform === 'win32' ? 'junction' : 'dir');
+      const subscription = await service.requestWorkingTreeWatch(alias, () => { notifications++; });
+      const events = Array.from({ length: process.env.GIT_IO_TRACE ? 2 : 10000 }, (_, i) => ({ type: 'update', path: join(i % 2 ? alias : worktree, 'ignored', 'noise') }));
+      // A shared CI runner can deschedule the child during a wall-clock sample.
+      // Keep the 20ms gate, but take three independent batches and require one
+      // responsive callback/timer pair. All batches must remain filesystem-free.
+      const samples = [];
+      for (let trial = 0; trial < (process.env.GIT_IO_TRACE ? 1 : 3); trial++) {
+        await tick();
+        let fsCalls = 0;
+        const hook = createHook({ init(_id, type) { if (type.startsWith('FSREQ')) fsCalls++; } });
+        await marker('FILTER_START');
+        hook.enable();
+        const started = performance.now();
+        const pulse = new Promise((resolve) => setTimeout(() => resolve(performance.now() - started), 0));
+        callback(null, events);
+        const filterMs = performance.now() - started;
+        hook.disable();
+        const loopGapMs = await pulse;
+        await marker('FILTER_END');
+        assert.equal(fsCalls, 0, "filesystem calls");
+        assert.equal(notifications, 0, "ignored event notification");
+        samples.push({ filterMs, loopGapMs, fsCalls });
+      }
+      console.log(JSON.stringify({ ...samples[0], samples }));
+      assert.ok(process.env.GIT_IO_TRACE || samples.some(({ filterMs, loopGapMs }) => filterMs < 20 && loopGapMs < 20), 'no responsive filter sample: ' + JSON.stringify(samples));
+      // Alias identity remains useful after deletion: no per-event realpath can recover this file.
+      callback(null, [{ type: 'delete', path: join(worktree, 'tracked.txt') }]);
+      assert.equal(notifications, 1);
+      await marker('REFRESH_START');
+      const snapshot = await service.getSnapshot(worktree);
+      assert.equal(snapshot.git.isGit, true);
+      assert.equal(snapshot.git.isPaseoOwnedWorktree, true);
+      await runGitCommand(['status', '--porcelain'], { cwd: alias, logger });
+      await marker('REFRESH_END');
+      subscription.unsubscribe();
+    } finally {
+      await service.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  `;
+  for (const tracing of [false, true]) {
+    const { stdout, stderr } = await promisify(execFile)(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        ...(tracing ? ["--trace-sync-io"] : []),
+        "--input-type=module",
+        "--eval",
+        source,
+      ],
+      {
+        cwd: repositoryRoot,
+        env: { ...process.env, GIT_IO_TRACE: tracing ? "1" : "" },
+        timeout: 30_000,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    ).catch((error) => {
+      throw new Error(String(error.stderr).replaceAll(/at .*/g, "[child stack omitted]"));
+    });
+    for (const phase of ["FILTER", "REFRESH"]) {
+      const output = stderr.split(`${phase}_START\n`)[1]?.split(`${phase}_END\n`)[0];
+      expect(output, `${phase}: synchronous filesystem IO`).toBe("");
+    }
+    expect(JSON.parse(stdout.trim().split("\n")[0])).toMatchObject({ fsCalls: 0 });
+  }
+}, 60_000);
+
+test("Git event identity preserves Windows namespace, case and subtree boundaries", async () => {
+  const { GitObservationPaths } = await import("./git-observation-paths.js");
+  const paths = await GitObservationPaths.create("C:\\paseo-observation-contract");
+  const accept = paths.createEventFilter(["C:\\paseo-observation-contract\\Build"]);
+  expect(paths.relative("\\\\?\\C:\\PASEO-OBSERVATION-CONTRACT\\refs\\heads\\MixedCase")).toBe(
+    "refs/heads/MixedCase",
+  );
+  expect(accept("\\\\?\\C:\\paseo-observation-contract\\build\\noise")).toBe(false);
+  expect(accept("C:\\paseo-observation-contract\\BuildSibling\\file")).toBe(true);
+});
+
+test("concurrent alias requests establish one working-tree subscription", async () => {
+  const { symlink } = await import("node:fs/promises");
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "git-observation-concurrent-")));
+  const repo = path.join(root, "repo");
+  const alias = path.join(root, "alias");
+  execFileSync("git", ["init", "-b", "main", repo], { stdio: "pipe" });
+  await symlink(repo, alias, process.platform === "win32" ? "junction" : "dir");
+  let subscriptions = 0;
+  const service = new WorkspaceGitServiceImpl({
+    logger: pino({ enabled: false }),
+    paseoHome: path.join(root, "home"),
+    deps: {
+      subscribe: async () => {
+        subscriptions++;
+        return { updateIgnore: async () => {}, unsubscribe: async () => {} };
+      },
+    },
+  });
+  try {
+    const watches = await Promise.all([
+      service.requestWorkingTreeWatch(repo, () => {}),
+      service.requestWorkingTreeWatch(alias, () => {}),
+    ]);
+    expect(subscriptions).toBe(1);
+    for (const watch of watches) watch.unsubscribe();
+  } finally {
+    await service.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Git event identity retains a symlink's literal target before canonicalizing its parent", async () => {
+  const { mkdir, symlink } = await import("node:fs/promises");
+  const { GitObservationPaths } = await import("./git-observation-paths.js");
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "git-observation-literal-target-")));
+  const repository = path.join(root, "repository");
+  const parentAlias = path.join(root, "parent-alias");
+  const workspaceAlias = path.join(root, "workspace-alias");
+  const literalTarget = path.join(parentAlias, "repository");
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  try {
+    await mkdir(repository);
+    await symlink(root, parentAlias, linkType);
+    await symlink(literalTarget, workspaceAlias, linkType);
+    const paths = await GitObservationPaths.create(workspaceAlias);
+    const accept = paths.createEventFilter([path.join(workspaceAlias, "ignored")]);
+    for (const spelling of [workspaceAlias, literalTarget, repository]) {
+      expect(paths.relative(path.join(spelling, "deleted.txt"))).toBe("deleted.txt");
+      expect(accept(path.join(spelling, "ignored", "deleted.txt"))).toBe(false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

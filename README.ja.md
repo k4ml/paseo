@@ -53,6 +53,17 @@
 - **クロスデバイス:** iOS、Android、デスクトップ、Web、CLI に対応。机で作業を始め、スマートフォンで確認し、ターミナルから自動化できます。
 - **プライバシー優先:** Paseo にはテレメトリー・トラッキング・強制ログインは一切ありません。
 
+## スポンサー
+
+<!-- Sponsors: one cell per sponsor in the order of packages/website/src/data/sponsors.ts, then "become a sponsor" cells up to three. -->
+<table>
+  <tr>
+    <td align="center" width="33%"><a href="https://hoplite.sh/?utm_source=paseo&utm_medium=readme&utm_campaign=sponsor"><picture><source media="(prefers-color-scheme: dark)" srcset="packages/website/public/sponsors/hoplite-on-dark.svg"><img src="packages/website/public/sponsors/hoplite-on-light.svg" alt="Hoplite" height="40"></picture></a><br><sub>Cloud coding agents</sub></td>
+    <td align="center" width="33%"><a href="https://paseo.sh/sponsor">Paseo のスポンサーになる</a></td>
+    <td align="center" width="33%"><a href="https://paseo.sh/sponsor">Paseo のスポンサーになる</a></td>
+  </tr>
+</table>
+
 ## はじめかた
 
 Paseo はコーディングエージェントを管理するローカルサーバー（デーモン）を起動します。デスクトップアプリ・モバイルアプリ・Web アプリ・CLI などのクライアントがこのデーモンに接続します。
@@ -151,12 +162,15 @@ npm run build:server
 npm run typecheck
 ```
 
+## Paseo を支援する
+
+Paseo は一人で開発しており、使ってくれる人たちの支援で成り立っています。[GitHub Sponsors](https://github.com/sponsors/boudra) で支援できます。企業として毎月[スポンサー](https://paseo.sh/sponsor#spot)になっていただくと、ロゴをこの README の冒頭と、paseo.sh のトップページおよびドキュメントに掲載します。
+
 ## 関連プロジェクト
 
 - [getpaseo/paseo-relay](https://github.com/getpaseo/paseo-relay) — Elixir 製の公式分散リレー
-- [paseo-skins](https://github.com/huangguang1999/paseo-skins) — Paseo デスクトップ向けコミュニティテーマと、Agent Skill 対応のゼロパッチテーマローダー
 - [paseo-vscode](https://marketplace.visualstudio.com/items?itemName=hinnes.paseo-vscode) — VS Code 拡張機能
 
 ## ライセンス
 
-AGPL-3.0
+Apache-2.0

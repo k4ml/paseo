@@ -2,6 +2,7 @@ import { ensureSherpaOnnxModels, getSherpaOnnxModelDir } from "./sherpa/model-do
 import {
   DEFAULT_LOCAL_STT_MODEL,
   DEFAULT_LOCAL_TTS_MODEL,
+  LocalSpeechModelIdSchema,
   LocalSttModelIdSchema,
   LocalTtsModelIdSchema,
   listSherpaOnnxModels,
@@ -13,6 +14,7 @@ import {
 export {
   DEFAULT_LOCAL_STT_MODEL,
   DEFAULT_LOCAL_TTS_MODEL,
+  LocalSpeechModelIdSchema,
   LocalSttModelIdSchema,
   LocalTtsModelIdSchema,
   type LocalSpeechModelId,
@@ -34,10 +36,12 @@ export async function ensureLocalSpeechModels(options: {
   modelsDir: string;
   modelIds: LocalSpeechModelId[];
   logger: import("pino").Logger;
+  signal?: AbortSignal;
 }): Promise<Record<LocalSpeechModelId, string>> {
   return ensureSherpaOnnxModels({
     modelsDir: options.modelsDir,
     modelIds: options.modelIds,
     logger: options.logger,
+    signal: options.signal,
   });
 }

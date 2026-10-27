@@ -3,15 +3,22 @@ import {
   type GlobalEvent,
   type OpencodeClient,
 } from "@opencode-ai/sdk/v2/client";
+import type { Logger } from "pino";
 
-export type OpenCodeEventSourceInput =
-  | GlobalEvent
-  | { type: "reconnected" }
-  | { type: "server-exited"; error: Error };
+export type OpenCodeEventSourceInput = GlobalEvent | { type: "server-exited"; error: Error };
 
 export interface OpenCodeEventSource {
   ready(): Promise<void>;
   subscribe(listener: (input: OpenCodeEventSourceInput) => void): () => void;
+  diagnostics?(): OpenCodeEventStreamDiagnostics;
+}
+
+export interface OpenCodeEventStreamDiagnostics {
+  attempt: number;
+  phase: "first-record" | "stream";
+  elapsedMs: number;
+  lastOutcome?: "ended" | "error" | "watchdog";
+  lastError?: string;
 }
 
 export interface OpenCodeEventConsumerTiming {
@@ -22,12 +29,26 @@ export interface OpenCodeEventConsumerTiming {
 export interface OpenCodeEventConsumerOptions {
   serverUrl: string;
   processExit: Promise<Error>;
+  listening?: Promise<void>;
+  logger: Pick<Logger, "debug" | "warn">;
   createClient?: (baseUrl: string) => OpencodeClient;
   timing?: OpenCodeEventConsumerTiming;
 }
 
+const FIRST_RECORD_WATCHDOG_MS = 5_000;
 const WATCHDOG_MS = 30_000;
 const MAX_BACKOFF_MS = 5_000;
+const FAILURE_WARNING_ATTEMPT = 4;
+
+type OpenCodeEventStreamPhase = "first-record" | "stream";
+type OpenCodeConnectionOutcome = "ended" | "error" | "watchdog";
+
+interface OpenCodeConnectionResult {
+  delivered: boolean;
+  phase: OpenCodeEventStreamPhase;
+  outcome: OpenCodeConnectionOutcome;
+  error?: unknown;
+}
 
 const systemTiming: OpenCodeEventConsumerTiming = {
   arm(delayMs, callback) {
@@ -53,12 +74,18 @@ const systemTiming: OpenCodeEventConsumerTiming = {
 export class OpenCodeEventConsumer implements OpenCodeEventSource {
   private readonly listeners = new Set<(input: OpenCodeEventSourceInput) => void>();
   private readonly client: OpencodeClient;
+  private readonly logger: Pick<Logger, "debug" | "warn">;
   private readonly timing: OpenCodeEventConsumerTiming;
+  private readonly startedAt = Date.now();
   private readonly readyPromise: Promise<void>;
   private resolveReady!: () => void;
   private rejectReady!: (error: Error) => void;
   private connectionAbort = new AbortController();
   private connectionTask: Promise<void>;
+  private attempt = 0;
+  private phase: OpenCodeEventStreamPhase = "first-record";
+  private lastOutcome?: OpenCodeConnectionOutcome;
+  private lastError?: string;
   private connected = false;
   private closed = false;
 
@@ -66,13 +93,14 @@ export class OpenCodeEventConsumer implements OpenCodeEventSource {
     this.client =
       options.createClient?.(options.serverUrl) ??
       createOpencodeClient({ baseUrl: options.serverUrl });
+    this.logger = options.logger;
     this.timing = options.timing ?? systemTiming;
     this.readyPromise = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve;
       this.rejectReady = reject;
     });
     void this.readyPromise.catch(() => undefined);
-    this.connectionTask = this.consume(options.processExit);
+    this.connectionTask = this.consume(options.processExit, options.listening);
     void this.connectionTask.catch(() => undefined);
   }
 
@@ -85,6 +113,16 @@ export class OpenCodeEventConsumer implements OpenCodeEventSource {
     return () => this.listeners.delete(listener);
   }
 
+  diagnostics(): OpenCodeEventStreamDiagnostics {
+    return {
+      attempt: this.attempt,
+      phase: this.phase,
+      elapsedMs: Date.now() - this.startedAt,
+      ...(this.lastOutcome === undefined ? {} : { lastOutcome: this.lastOutcome }),
+      ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
+    };
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -95,53 +133,161 @@ export class OpenCodeEventConsumer implements OpenCodeEventSource {
     await this.connectionTask.catch(() => undefined);
   }
 
-  private async consume(processExit: Promise<Error>): Promise<void> {
+  private async consume(processExit: Promise<Error>, listening?: Promise<void>): Promise<void> {
     void processExit.then((error) => this.exit(error));
+    if (listening) {
+      const signal = this.connectionAbort.signal;
+      let stopWaiting!: () => void;
+      const stopped = new Promise<void>((resolve) => {
+        stopWaiting = resolve;
+      });
+      signal.addEventListener("abort", stopWaiting, { once: true });
+      try {
+        await Promise.race([listening, stopped]);
+      } catch {
+        return;
+      } finally {
+        signal.removeEventListener("abort", stopWaiting);
+      }
+    }
     let reconnectAttempt = 0;
     while (!this.closed) {
-      const delivered = await this.consumeConnection(this.connectionAbort.signal).catch(
-        () => false,
-      );
+      this.attempt += 1;
+      this.phase = "first-record";
+      const result = await this.consumeConnection(this.connectionAbort.signal);
       if (this.closed) return;
-      reconnectAttempt = delivered ? 0 : reconnectAttempt + 1;
+      this.lastOutcome = result.outcome;
+      this.lastError = result.error === undefined ? undefined : errorMessage(result.error);
+      reconnectAttempt = result.delivered ? 0 : reconnectAttempt + 1;
       const delayMs = Math.min(100 * 2 ** Math.max(0, reconnectAttempt - 1), MAX_BACKOFF_MS);
+      this.logConnectionFailure(result, this.attempt, reconnectAttempt, delayMs);
       await this.timing.wait(delayMs, this.connectionAbort.signal).catch(() => undefined);
     }
   }
 
-  private async consumeConnection(signal: AbortSignal): Promise<boolean> {
+  private async consumeConnection(signal: AbortSignal): Promise<OpenCodeConnectionResult> {
     const requestAbort = new AbortController();
-    const abortRequest = () => requestAbort.abort(signal.reason);
+    const attemptToken = { active: true };
+    let resolveAbandoned!: (result: OpenCodeConnectionResult) => void;
+    const abandoned = new Promise<OpenCodeConnectionResult>((resolve) => {
+      resolveAbandoned = resolve;
+    });
+    const abortRequest = () => {
+      attemptToken.active = false;
+      resolveAbandoned({ delivered, phase, outcome: "ended" });
+      requestAbort.abort(signal.reason);
+    };
     signal.addEventListener("abort", abortRequest, { once: true });
     let cancelWatchdog: () => void = () => undefined;
     let delivered = false;
-    try {
-      const result = await this.client.global.event({
-        signal: requestAbort.signal,
-        sseMaxRetryAttempts: 0,
-      });
-      const armWatchdog = () => {
-        cancelWatchdog();
-        cancelWatchdog = this.timing.arm(WATCHDOG_MS, () => requestAbort.abort());
-      };
-      armWatchdog();
-      for await (const event of result.stream) {
-        if (this.closed) return delivered;
-        armWatchdog();
-        if (!delivered) {
+    let phase: OpenCodeEventStreamPhase = "first-record";
+    let sseError: unknown;
+    const armWatchdog = () => {
+      cancelWatchdog();
+      cancelWatchdog = this.timing.arm(
+        this.connected ? WATCHDOG_MS : FIRST_RECORD_WATCHDOG_MS,
+        () => {
+          const error = new Error(`OpenCode event stream ${phase} watchdog expired`);
+          // Abandon a stalled request even when fetch ignores abort, for example during OpenCode startup.
+          attemptToken.active = false;
+          resolveAbandoned({ delivered, phase, outcome: "watchdog", error });
+          requestAbort.abort(error);
+        },
+      );
+    };
+    const consumeStream = async (): Promise<OpenCodeConnectionResult> => {
+      try {
+        const result = await this.client.global.event({
+          signal: requestAbort.signal,
+          sseMaxRetryAttempts: 0,
+          onSseError: (error) => {
+            sseError = error;
+          },
+        });
+        for await (const event of result.stream) {
+          // Ignore late records from abandoned requests, for example a delayed server.connected event.
+          if (this.closed || !attemptToken.active) {
+            return { delivered, phase, outcome: "ended" };
+          }
           delivered = true;
-          if (this.connected) this.publish({ type: "reconnected" });
-          this.connected = true;
-          this.resolveReady();
+          phase = "stream";
+          this.phase = phase;
+          if (!this.connected && event.payload.type === "server.connected") {
+            this.connected = true;
+            this.resolveReady();
+            armWatchdog();
+            continue;
+          }
+          armWatchdog();
+          this.logPluginFailure(event);
+          this.publish(event);
         }
-        this.publish(event);
+        let outcome: OpenCodeConnectionOutcome = "ended";
+        if (sseError !== undefined) outcome = "error";
+        return {
+          delivered,
+          phase,
+          outcome,
+          ...(sseError === undefined ? {} : { error: sseError }),
+        };
+      } catch (error) {
+        return {
+          delivered,
+          phase,
+          outcome: "error",
+          error,
+        };
       }
-      return delivered;
+    };
+    armWatchdog();
+    try {
+      return await Promise.race([consumeStream(), abandoned]);
     } finally {
+      attemptToken.active = false;
       cancelWatchdog();
       signal.removeEventListener("abort", abortRequest);
       requestAbort.abort();
     }
+  }
+
+  private logPluginFailure(event: GlobalEvent): void {
+    if (event.payload.type !== "session.error") return;
+    const error = event.payload.properties.error;
+    if (!containsPluginError(error)) return;
+    this.logger.warn(
+      {
+        directory: event.directory,
+        sessionId: event.payload.properties.sessionID,
+        error,
+      },
+      "OpenCode plugin failed",
+    );
+  }
+
+  private logConnectionFailure(
+    result: OpenCodeConnectionResult,
+    attempt: number,
+    consecutiveFailures: number,
+    retryDelayMs: number,
+  ): void {
+    const elapsedMs = Date.now() - this.startedAt;
+    const details = {
+      ...(result.error === undefined ? {} : { err: result.error }),
+      phase: result.phase,
+      outcome: result.outcome,
+      attempt,
+      consecutiveFailures,
+      elapsedMs,
+      retryDelayMs,
+      everReady: this.connected,
+    };
+    const log =
+      result.outcome === "watchdog" ||
+      this.connected ||
+      consecutiveFailures >= FAILURE_WARNING_ATTEMPT
+        ? this.logger.warn.bind(this.logger)
+        : this.logger.debug.bind(this.logger);
+    log(details, "OpenCode event stream connection failed; retrying");
   }
 
   private exit(error: Error): void {
@@ -164,6 +310,18 @@ export class OpenCodeEventConsumer implements OpenCodeEventSource {
   }
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function containsPluginError(error: unknown): boolean {
+  try {
+    return JSON.stringify(error).toLowerCase().includes("plugin");
+  } catch {
+    return false;
+  }
+}
+
 export type OpenCodeEventConsumerFactory = (
-  options: Pick<OpenCodeEventConsumerOptions, "serverUrl" | "processExit">,
+  options: Pick<OpenCodeEventConsumerOptions, "serverUrl" | "processExit" | "logger" | "listening">,
 ) => OpenCodeEventConsumer;
