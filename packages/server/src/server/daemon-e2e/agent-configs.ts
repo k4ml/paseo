@@ -70,7 +70,7 @@ export const agentConfigs = {
     provider: "commandcode",
     model: "claude-sonnet-4-6",
     modes: {
-      full: "yolo",
+      full: "bypass",
       ask: "default",
     },
   },

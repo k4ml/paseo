@@ -167,32 +167,41 @@ export const OMP_MODES: AgentProviderModeDefinition[] = [
   },
 ];
 
+// Command Code reports these ids in `session/new` over ACP; the visuals are UI
+// scaffolding layered on top (see COMMANDCODE_MODES in commandcode-acp-agent.ts).
 const COMMANDCODE_MODES: AgentProviderModeDefinition[] = [
   {
     id: "default",
-    label: "Default",
-    description: "Prompts for permission before edits and commands",
+    label: "Standard",
+    description: "Ask before running tools that change anything.",
     icon: "Shield",
     colorTier: "safe",
   },
   {
     id: "auto-accept",
-    label: "Auto Accept",
-    description: "Accepts file edits automatically",
+    label: "Accept Edits",
+    description: "Auto-accept file edits; still ask for riskier actions.",
     icon: "ShieldPlus",
     colorTier: "moderate",
   },
   {
     id: "plan",
     label: "Plan",
-    description: "Read-only planning mode that avoids file edits",
+    description: "Research and plan only — no edits or commands.",
     icon: "ShieldEllipsis",
     colorTier: "planning",
   },
   {
-    id: "yolo",
-    label: "Yolo",
-    description: "Bypasses all permission prompts",
+    id: "dont-ask",
+    label: "Don't Ask",
+    description: "Run without prompting, keeping the safety rails on.",
+    icon: "ShieldAlert",
+    colorTier: "moderate",
+  },
+  {
+    id: "bypass",
+    label: "Bypass Permissions",
+    description: "Skip every permission check (use with care).",
     icon: "ShieldOff",
     colorTier: "dangerous",
     isUnattended: true,

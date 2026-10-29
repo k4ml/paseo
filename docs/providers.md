@@ -40,7 +40,7 @@ server and tool identity without approving native tools.
 
 Extend `ACPAgentClient` from `packages/server/src/server/agent/providers/acp-agent.ts`. The base class handles process spawning, stdio transport, session lifecycle, streaming, permissions, and model discovery. You provide configuration (command, modes, capabilities) and optionally override `isAvailable()` for auth checks.
 
-The only built-in ACP provider today is `copilot` (`copilot-acp-agent.ts`). `GenericACPAgentClient` (`generic-acp-agent.ts`) is also ACP-based but is used for user-defined custom providers configured via `extends: "acp"` overrides — see [docs/custom-providers.md](custom-providers.md).
+The built-in ACP providers are `copilot` (`copilot-acp-agent.ts`) and `commandcode` (`commandcode-acp-agent.ts`). `GenericACPAgentClient` (`generic-acp-agent.ts`) is also ACP-based but is used for user-defined custom providers configured via `extends: "acp"` overrides — see [docs/custom-providers.md](custom-providers.md).
 
 Copilot custom agents are exposed through ACP session config, not the slash-command list. When custom agents are available, Copilot returns a select config option with `id: "agent"` and `category: "_agent"`; Paseo maps that to the `agent` provider feature. Copilot uses the agent display name as the option value, and the blank value means the default Copilot agent.
 
@@ -53,13 +53,26 @@ preferences and selection history. Cursor versions without that extension must b
 still probes model selections in its own shim. The initial session supplies modes and the current
 model; it does not override the model list returned by a resolver.
 
+Command Code (the `command-code` npm CLI, binary `cmd`) exposes `cmd acp`, so
+`commandcode-acp-agent.ts` is a thin `ACPAgentClient` subclass over `defaultCommand: ["cmd", "acp"]`.
+It deliberately does not drive headless `cmd -p`: print mode hard-blocks `edit_file`, `write_file`,
+`shell_command`, `monitor_command`, and `kill_shell` unless `--yolo` is passed, and `--permission-mode`
+cannot authorize them, so only `--yolo` runs could touch files or run commands and there was no
+channel to answer a prompt. Over ACP the same permission modes arrive as session modes (`default`,
+`auto-accept`, `plan`, `dont-ask`, `bypass`) and Paseo's approval UI answers them, so `default` works.
+Modes, models, and thinking options all come from `session/new`; the initial response carries a `model`
+and a thought-level config option (id `effort` on 1.88.2, selected by category), so there is no
+`catalogModelResolver` and no curated catalog.
+Command Code handles its own auth (`cmd login`) — the ACP `authMethods` entry is informational, so the
+provider never calls `authenticate`. Sessions list, resume, and close via `sessionCapabilities`,
+images are accepted (`promptCapabilities.image`), and HTTP MCP (`mcpCapabilities.http`) lets Paseo
+inject `/mcp/agents`.
+
 ### Direct
 
 Implement the `AgentClient` and `AgentSession` interfaces from `agent-sdk-types.ts` yourself. This gives full control but requires you to handle process management, streaming, permissions, and session persistence from scratch.
 
-Existing direct providers: `claude` (in `providers/claude/agent.ts`), `codex` (`codex-app-server-agent.ts`), `opencode` (`opencode/runtime-client.ts`), `pi` (`providers/pi/agent.ts`), `omp` (`providers/omp/agent.ts`), and `commandcode` (`providers/commandcode/agent.ts`). The dev-only `mock` provider (`mock-load-test-agent.ts`) is also direct.
-
-Command Code (the `command-code` npm CLI, binary `cmd`) has no ACP or RPC surface, so its provider drives headless `cmd -p` runs instead: one Paseo session maps to one native Command Code headless session per cwd. Each turn spawns a short-lived `cmd -p "<prompt>" --output-format json` child; after the first turn the native `sessionId` from the result frame is pinned with `--resume <id>` so distinct Paseo agents in the same cwd never share a conversation (bare `--continue` is never used). Modes map to permission flags: `default` → `--permission-mode standard`, `auto-accept` → `--permission-mode auto-accept`, `plan` → `--permission-mode plan`, `yolo` → `--yolo`. Command Code manages its own auth and MCP servers, so the provider reports `supportsMcpServers: false` and Paseo never injects `/mcp/agents`. Models come from a curated static list merged with `cmd --list-models` at catalog refresh. No session listing or import — headless mode does not expose one.
+Existing direct providers: `claude` (in `providers/claude/agent.ts`), `codex` (`codex-app-server-agent.ts`), `opencode` (`opencode/runtime-client.ts`), `pi` (`providers/pi/agent.ts`), and `omp` (`providers/omp/agent.ts`). The dev-only `mock` provider (`mock-load-test-agent.ts`) is also direct.
 
 Claude first-party model metadata lives in `packages/server/src/server/agent/providers/claude/model-manifest.ts`. When adding or updating a Claude model, update that manifest only; the model picker thinking options and Claude-specific feature gates are derived from the manifest. Do not add model-specific Claude capability lists in feature code.
 

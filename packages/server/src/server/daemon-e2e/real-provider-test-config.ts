@@ -8,7 +8,7 @@ import type { AgentClient, AgentProvider, AgentSessionConfig } from "../agent/ag
 import type { ProviderRuntimeSettings } from "../agent/provider-launch-config.js";
 import { ClaudeAgentClient } from "../agent/providers/claude/agent.js";
 import { CodexAppServerAgentClient } from "../agent/providers/codex-app-server-agent.js";
-import { CommandCodeAgentClient } from "../agent/providers/commandcode/agent.js";
+import { CommandCodeACPAgentClient } from "../agent/providers/commandcode-acp-agent.js";
 import { OpenCodeAgentClient } from "../agent/providers/opencode-agent.js";
 import { OmpAgentClient } from "../agent/providers/omp/agent.js";
 import { PiRpcAgentClient } from "../agent/providers/pi/agent.js";
@@ -73,7 +73,7 @@ export function getRealProviderConfig(provider: RealProvider): RealProviderConfi
       return {
         provider,
         model: "claude-sonnet-4-6",
-        modeId: "yolo",
+        modeId: "bypass",
       };
   }
 }
@@ -162,7 +162,7 @@ export function createRealProviderClient(provider: RealProvider, logger: Logger)
     case "omp":
       return new OmpAgentClient({ logger, runtimeSettings });
     case "commandcode":
-      return new CommandCodeAgentClient({ logger, runtimeSettings });
+      return new CommandCodeACPAgentClient({ logger, runtimeSettings });
   }
 }
 
