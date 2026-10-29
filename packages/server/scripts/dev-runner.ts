@@ -2,6 +2,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
+import { mergePathEntries, resolveLoginShellPath } from "./login-shell-env.js";
+
 dotenv.config({
   path: fileURLToPath(new URL("../.env", import.meta.url)),
   quiet: true,
@@ -11,10 +13,16 @@ const daemonRunnerEntry = fileURLToPath(new URL("./supervisor-entrypoint.ts", im
 
 const supervisorArgs = [...process.execArgv, daemonRunnerEntry, "--dev", ...process.argv.slice(2)];
 
+// This process was not started from an interactive shell, so its PATH is bare and
+// providers cannot find the user's tools. Merge the login-shell PATH in before
+// the supervisor (and the daemon it owns) inherits it.
+const mergedPath = mergePathEntries(process.env.PATH, resolveLoginShellPath() ?? undefined);
+
 const supervisor = spawn(process.execPath, supervisorArgs, {
   stdio: "inherit",
   env: {
     ...process.env,
+    ...(mergedPath ? { PATH: mergedPath } : {}),
     PASEO_LOG_FORMAT: process.env.PASEO_LOG_FORMAT ?? "pretty",
   },
 });
