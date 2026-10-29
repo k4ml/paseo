@@ -4,7 +4,7 @@ import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../../utils/spawn.js";
 import { signalProcessTree } from "../../../../utils/tree-kill.js";
-import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
+import type { ProviderCommand, ProviderRuntimeSettings } from "../../provider-launch-config.js";
 import {
   createCommandCodeStreamParser,
   type CommandCodeFrame,
@@ -14,6 +14,27 @@ import {
 export const DEFAULT_COMMANDCODE_COMMAND: [string, ...string[]] = [
   process.env.COMMANDCODE_COMMAND ?? "cmd",
 ];
+
+/**
+ * Effective `[binary, ...baseArgs]` for the CLI. Mirrors `resolveProviderLaunch`
+ * so the binary the availability check approves is the binary the run and the
+ * `--list-models` probe actually spawn: replace mode supplies the whole argv,
+ * append mode inserts extra args after the default binary.
+ */
+export function resolveRuntimeCommand(
+  commandConfig: ProviderCommand | undefined,
+  defaultCommand: [string, ...string[]],
+): [string, ...string[]] {
+  const [defaultBinary, ...defaultArgs] = defaultCommand;
+  if (commandConfig?.mode === "replace") {
+    const [binary, ...args] = commandConfig.argv;
+    return [binary, ...args];
+  }
+  if (commandConfig?.mode === "append") {
+    return [defaultBinary, ...defaultArgs, ...(commandConfig.args ?? [])];
+  }
+  return defaultCommand;
+}
 
 export interface CommandCodeLaunch {
   cwd: string;
@@ -74,7 +95,9 @@ export class CommandCodeCliRuntime implements CommandCodeRuntime {
 
   constructor(options: CommandCodeRuntimeOptions) {
     this.logger = options.logger;
-    this.command = options.command ?? DEFAULT_COMMANDCODE_COMMAND;
+    this.command =
+      options.command ??
+      resolveRuntimeCommand(options.runtimeSettings?.command, DEFAULT_COMMANDCODE_COMMAND);
     this.env = options.runtimeSettings?.env;
     this.spawnProcessOverride = options.spawnProcessOverride;
   }
@@ -92,11 +115,12 @@ export class CommandCodeCliRuntime implements CommandCodeRuntime {
     argv: string[],
     options?: { cwd?: string; timeoutMs?: number },
   ): Promise<string | null> {
-    const command = this.command[0];
-    const args = [...this.command.slice(1), ...argv];
+    // `spawnChild` prepends the binary and its base args, so pass only the
+    // probe's own args here. Including the binary again ran `cmd cmd ...`,
+    // which the CLI treats as a prompt instead of a model listing.
     const child = this.spawnChild({
       cwd: options?.cwd ?? process.cwd(),
-      argv: [command, ...args],
+      argv,
     });
     const timeoutMs = options?.timeoutMs ?? 15_000;
 
